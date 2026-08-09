@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         JavStore Full Layout Cleanup - No Sidebars + Mosaic Overlay
 // @namespace    http://tampermonkey.net/
-// @version      6.0.0
+// @version      6.0.1
 // @description  Clean up JavStore's layout, filter keyword-matched thumbnails, and track visited items with private, configurable controls.
 // @homepageURL  https://github.com/jitdor/userscript-javstore
 // @supportURL   https://github.com/jitdor/userscript-javstore/issues
@@ -19,7 +19,7 @@
 (function () {
     'use strict';
 
-    const SCRIPT_VERSION = '6.0.0';
+    const SCRIPT_VERSION = '6.0.1';
     const STORAGE_VERSION = 2;
     const STORAGE_KEY = 'javstore_cleanup_state_v2';
     const LEGACY_STORAGE_KEY = 'javstore_seen_links';
@@ -138,9 +138,15 @@
         return result;
     }
 
-    function readStoredState() {
+    // GM_getValue/GM_setValue are synchronous in Tampermonkey/Violentmonkey but some
+    // engines (e.g. AdGuard's userscript support) alias them to the async GM4 API, where
+    // they return a Promise instead of the value. Routing every call through
+    // Promise.resolve() handles both without needing to detect which one we're on—but it
+    // does mean a plain object is never mistaken for stored state; a Promise passing
+    // `typeof === 'object'` unchecked previously made every reload look empty.
+    async function readStoredState() {
         try {
-            const state = GM_getValue(STORAGE_KEY, null);
+            const state = await Promise.resolve(GM_getValue(STORAGE_KEY, null));
             if (!state || typeof state !== 'object') return null;
             return state;
         } catch (error) {
@@ -162,19 +168,25 @@
     }
 
     function persistState() {
-        if (!storageAvailable) return false;
+        if (!storageAvailable) return Promise.resolve(false);
         try {
-            GM_setValue(STORAGE_KEY, serializeState());
-            return true;
+            return Promise.resolve(GM_setValue(STORAGE_KEY, serializeState()))
+                .then(() => true)
+                .catch(error => {
+                    storageAvailable = false;
+                    console.warn('[JVS] Could not save settings or visited history.', error);
+                    showToast('Could not save—userscript storage is unavailable.', true);
+                    return false;
+                });
         } catch (error) {
             storageAvailable = false;
             console.warn('[JVS] Could not save settings or visited history.', error);
-            showToast('Could not save—Tampermonkey storage is unavailable.', true);
-            return false;
+            showToast('Could not save—userscript storage is unavailable.', true);
+            return Promise.resolve(false);
         }
     }
 
-    function migrateLegacyHistory() {
+    async function migrateLegacyHistory() {
         let raw;
         try {
             raw = localStorage.getItem(LEGACY_STORAGE_KEY);
@@ -189,7 +201,7 @@
                 const migratedAt = Date.now();
                 entries.forEach(url => visited.set(normalizeUrl(url), migratedAt));
                 pruneVisited();
-                if (!persistState()) return;
+                if (!(await persistState())) return;
             }
             localStorage.removeItem(LEGACY_STORAGE_KEY);
         } catch (error) {
@@ -219,12 +231,9 @@
         }
     }
 
-    const initialState = readStoredState();
-    settings = sanitizeSettings(initialState?.settings);
-    visited = parseVisited(initialState?.visited);
-    overrides = parseOverrides(initialState?.overrides);
-    pruneVisited();
-    migrateLegacyHistory();
+    settings = sanitizeSettings();
+    visited = new Map();
+    overrides = new Map();
 
     function setRootState() {
         const root = document.documentElement;
@@ -1057,9 +1066,20 @@
         }
     }
 
-    if (document.readyState === 'loading') {
-        document.addEventListener('DOMContentLoaded', onReady, { once: true });
-    } else {
+    async function boot() {
+        const initialState = await readStoredState();
+        settings = sanitizeSettings(initialState?.settings);
+        visited = parseVisited(initialState?.visited);
+        overrides = parseOverrides(initialState?.overrides);
+        pruneVisited();
+        await migrateLegacyHistory();
+        setRootState();
+
+        if (document.readyState === 'loading') {
+            await new Promise(resolve => document.addEventListener('DOMContentLoaded', resolve, { once: true }));
+        }
         onReady();
     }
+
+    boot();
 })();
