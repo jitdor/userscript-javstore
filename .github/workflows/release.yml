@@ -1,0 +1,67 @@
+name: Publish release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to release (e.g. 6.0.1). Must match the @version header in the userscript and have a matching ## <version> section in CHANGELOG.md.'
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Verify script version matches input
+        run: |
+          set -euo pipefail
+          declared="$(grep -m1 '^// @version' javstore-full-layout-cleanup.user.js | awk '{print $3}')"
+          if [ "$declared" != "${{ inputs.version }}" ]; then
+            echo "::error::Input version '${{ inputs.version }}' does not match the @version header ('$declared') in javstore-full-layout-cleanup.user.js"
+            exit 1
+          fi
+
+      - name: Extract changelog section
+        run: |
+          set -euo pipefail
+          awk -v ver="${{ inputs.version }}" '
+            $0 ~ "^## " ver "$" { found=1; next }
+            found && /^## / { exit }
+            found { print }
+          ' CHANGELOG.md > highlights.md
+          if [ ! -s highlights.md ]; then
+            echo "::error::No '## ${{ inputs.version }}' section found in CHANGELOG.md"
+            exit 1
+          fi
+
+      - name: Build release notes
+        run: |
+          set -euo pipefail
+          checksum="$(sha256sum javstore-full-layout-cleanup.user.js | awk '{print $1}')"
+          {
+            echo "## Highlights"
+            echo
+            cat highlights.md
+            echo
+            echo "## Install"
+            echo
+            echo "Download \`javstore-full-layout-cleanup.user.js\` below, or use the stable [latest-release installer](https://github.com/${{ github.repository }}/releases/latest/download/javstore-full-layout-cleanup.user.js)."
+            echo
+            echo "**SHA-256:** \`$checksum\`"
+          } > release-notes.md
+
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          gh release create "v${{ inputs.version }}" \
+            javstore-full-layout-cleanup.user.js \
+            --repo "${{ github.repository }}" \
+            --title "JavStore Full Layout Cleanup ${{ inputs.version }}" \
+            --notes-file release-notes.md
