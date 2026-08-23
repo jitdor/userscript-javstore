@@ -1,14 +1,23 @@
 name: Publish release
 
+# Pushes to main publish a release automatically when the @version header names a
+# version that has no release yet; pushes that do not bump it are a no-op. The manual
+# trigger stays for re-publishing or for releasing from a branch.
 on:
+  push:
+    branches: [main]
   workflow_dispatch:
     inputs:
       version:
-        description: 'Version to release (e.g. 6.0.1). Must match the @version header in the userscript and have a matching ## <version> section in CHANGELOG.md.'
-        required: true
+        description: 'Version to release (e.g. 6.1.0). Optional—defaults to the @version header. When given it must match that header and have a matching ## <version> section in CHANGELOG.md.'
+        required: false
 
 permissions:
   contents: write
+
+concurrency:
+  group: publish-release
+  cancel-in-progress: false
 
 jobs:
   release:
@@ -17,29 +26,78 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Verify script version matches input
+      - name: Resolve version
+        id: version
         run: |
           set -euo pipefail
           declared="$(grep -m1 '^// @version' javstore-full-layout-cleanup.user.js | awk '{print $3}')"
-          if [ "$declared" != "${{ inputs.version }}" ]; then
-            echo "::error::Input version '${{ inputs.version }}' does not match the @version header ('$declared') in javstore-full-layout-cleanup.user.js"
+          if [ -z "$declared" ]; then
+            echo "::error::No @version header found in javstore-full-layout-cleanup.user.js"
             exit 1
+          fi
+          requested="${{ inputs.version }}"
+          if [ -n "$requested" ] && [ "$requested" != "$declared" ]; then
+            echo "::error::Input version '$requested' does not match the @version header ('$declared') in javstore-full-layout-cleanup.user.js"
+            exit 1
+          fi
+          echo "value=$declared" >> "$GITHUB_OUTPUT"
+          echo "Releasing version $declared"
+
+      - name: Check whether the release already exists
+        id: existing
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ steps.version.outputs.value }}
+        run: |
+          set -euo pipefail
+          if gh release view "v$VERSION" --repo "${{ github.repository }}" >/dev/null 2>&1; then
+            if [ "${{ github.event_name }}" != "push" ]; then
+              echo "::error::Release v$VERSION already exists. Bump the @version header, or delete the release to re-publish it."
+              exit 1
+            fi
+            echo "::notice::Release v$VERSION already exists; nothing to publish for this push."
+            echo "publish=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "publish=true" >> "$GITHUB_OUTPUT"
           fi
 
       - name: Extract changelog section
+        if: steps.existing.outputs.publish == 'true'
+        env:
+          VERSION: ${{ steps.version.outputs.value }}
         run: |
           set -euo pipefail
-          awk -v ver="${{ inputs.version }}" '
+          awk -v ver="$VERSION" '
             $0 ~ "^## " ver "$" { found=1; next }
             found && /^## / { exit }
             found { print }
           ' CHANGELOG.md > highlights.md
           if [ ! -s highlights.md ]; then
-            echo "::error::No '## ${{ inputs.version }}' section found in CHANGELOG.md"
+            echo "::error::No '## $VERSION' section found in CHANGELOG.md"
             exit 1
           fi
 
+      - name: Set up Node.js
+        if: steps.existing.outputs.publish == 'true'
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      # The release asset is the userscript itself, so it ships only if its own suite passes.
+      - name: Check userscript syntax
+        if: steps.existing.outputs.publish == 'true'
+        run: node --check javstore-full-layout-cleanup.user.js
+
+      - name: Install test dependencies
+        if: steps.existing.outputs.publish == 'true'
+        run: npm install --no-audit --no-fund
+
+      - name: Run tests
+        if: steps.existing.outputs.publish == 'true'
+        run: npm test
+
       - name: Build release notes
+        if: steps.existing.outputs.publish == 'true'
         run: |
           set -euo pipefail
           checksum="$(sha256sum javstore-full-layout-cleanup.user.js | awk '{print $1}')"
@@ -56,12 +114,14 @@ jobs:
           } > release-notes.md
 
       - name: Create release
+        if: steps.existing.outputs.publish == 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ steps.version.outputs.value }}
         run: |
           set -euo pipefail
-          gh release create "v${{ inputs.version }}" \
+          gh release create "v$VERSION" \
             javstore-full-layout-cleanup.user.js \
             --repo "${{ github.repository }}" \
-            --title "JavStore Full Layout Cleanup ${{ inputs.version }}" \
+            --title "JavStore Full Layout Cleanup $VERSION" \
             --notes-file release-notes.md
