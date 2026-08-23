@@ -1,0 +1,28 @@
+name: Tests
+
+on:
+  push:
+    branches: ['**']
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Check userscript syntax
+        run: node --check javstore-full-layout-cleanup.user.js
+
+      - name: Install test dependencies
+        run: npm install --no-audit --no-fund
+
+      - name: Run tests
+        run: npm test

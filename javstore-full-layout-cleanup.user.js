@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         JavStore Full Layout Cleanup - No Sidebars + Mosaic Overlay
 // @namespace    http://tampermonkey.net/
-// @version      6.0.1
+// @version      6.1.0
 // @description  Clean up JavStore's layout, filter keyword-matched thumbnails, and track visited items with private, configurable controls.
 // @homepageURL  https://github.com/jitdor/userscript-javstore
 // @supportURL   https://github.com/jitdor/userscript-javstore/issues
@@ -19,11 +19,17 @@
 (function () {
     'use strict';
 
-    const SCRIPT_VERSION = '6.0.1';
-    const STORAGE_VERSION = 2;
+    const SCRIPT_VERSION = '6.1.0';
+    const STORAGE_VERSION = 3;
     const STORAGE_KEY = 'javstore_cleanup_state_v2';
     const LEGACY_STORAGE_KEY = 'javstore_seen_links';
+    const PENDING_VISITS_KEY = 'javstore_pending_visits';
     const MAX_VISITED_ITEMS = 5000;
+    const MAX_PENDING_VISITS = 50;
+    const MAX_TOMBSTONES = 2000;
+    const TOMBSTONE_TTL_MS = 90 * 86400000;
+    const SYNC_POLL_MS = 45000;
+    const NON_ITEM_PATH = /^\/(?:page|search|tag|tags|category|categories|login|logout|register|profile|user|feed|rss)(?:\/|$)/i;
     const CARD_SELECTOR = 'main .grid a[href]';
 
     const DEFAULT_SETTINGS = Object.freeze({
@@ -39,6 +45,7 @@
         recoverDuration: 200,
         toggleKey: 'm',
         trackVisited: true,
+        fastNavigationSafety: true,
         visitedOpacity: 0.7,
         retentionDays: 0,
         hideSidebar: true,
@@ -53,6 +60,14 @@
     let settings;
     let visited = new Map();
     let overrides = new Map();
+    let overrideTimes = new Map();
+    let tombstones = new Map();
+    let resetAt = 0;
+    let lastKnownUpdatedAt = 0;
+    let lastSavedAt = 0;
+    let lastSaveFailed = false;
+    let writeQueue = Promise.resolve(false);
+    let syncTimer = 0;
     let storageAvailable = true;
     let observer = null;
     let ui = null;
@@ -96,6 +111,7 @@
             toggleKey: String(candidate.toggleKey || DEFAULT_SETTINGS.toggleKey).trim().slice(0, 1).toLowerCase()
                 || DEFAULT_SETTINGS.toggleKey,
             trackVisited: candidate.trackVisited !== false,
+            fastNavigationSafety: candidate.fastNavigationSafety !== false,
             visitedOpacity: clamp(candidate.visitedOpacity, 0.4, 1, DEFAULT_SETTINGS.visitedOpacity),
             retentionDays: clamp(candidate.retentionDays, 0, 3650, DEFAULT_SETTINGS.retentionDays),
             hideSidebar: candidate.hideSidebar !== false,
@@ -127,6 +143,21 @@
         return result;
     }
 
+    function parseTimestamp(value) {
+        const time = Number(value);
+        return Number.isFinite(time) && time > 0 ? time : 0;
+    }
+
+    function parseTimestamps(value) {
+        const result = new Map();
+        if (!value || typeof value !== 'object' || Array.isArray(value)) return result;
+        Object.entries(value).forEach(([key, timestamp]) => {
+            const time = parseTimestamp(timestamp);
+            if (key && time) result.set(key, time);
+        });
+        return result;
+    }
+
     function parseOverrides(value) {
         const result = new Map();
         if (!value || typeof value !== 'object' || Array.isArray(value)) return result;
@@ -147,11 +178,12 @@
     async function readStoredState() {
         try {
             const state = await Promise.resolve(GM_getValue(STORAGE_KEY, null));
+            storageAvailable = true;
             if (!state || typeof state !== 'object') return null;
             return state;
         } catch (error) {
             storageAvailable = false;
-            console.warn('[JVS] Isolated storage is unavailable.', error);
+            console.warn('[JVS] Isolated storage could not be read.', error);
             return null;
         }
     }
@@ -161,29 +193,235 @@
             version: STORAGE_VERSION,
             scriptVersion: SCRIPT_VERSION,
             updatedAt: Date.now(),
+            resetAt,
             settings: { ...settings },
             visited: Object.fromEntries(visited),
             overrides: Object.fromEntries(overrides),
+            overrideTimes: Object.fromEntries(overrideTimes),
+            tombstones: Object.fromEntries(tombstones),
         };
     }
 
-    function persistState() {
-        if (!storageAvailable) return Promise.resolve(false);
-        try {
-            return Promise.resolve(GM_setValue(STORAGE_KEY, serializeState()))
-                .then(() => true)
-                .catch(error => {
-                    storageAvailable = false;
-                    console.warn('[JVS] Could not save settings or visited history.', error);
-                    showToast('Could not save—userscript storage is unavailable.', true);
-                    return false;
-                });
-        } catch (error) {
-            storageAvailable = false;
-            console.warn('[JVS] Could not save settings or visited history.', error);
-            showToast('Could not save—userscript storage is unavailable.', true);
-            return Promise.resolve(false);
+    function tombstoneKey(kind, url) {
+        return `${kind}|${url}`;
+    }
+
+    function tombstoneTime(kind, url) {
+        return tombstones.get(tombstoneKey(kind, url)) || 0;
+    }
+
+    function forgetVisited(url, at = Date.now()) {
+        visited.delete(url);
+        tombstones.set(tombstoneKey('v', url), at);
+    }
+
+    function forgetOverride(url, at = Date.now()) {
+        overrides.delete(url);
+        overrideTimes.delete(url);
+        tombstones.set(tombstoneKey('o', url), at);
+    }
+
+    // Engines without GM_addValueChangeListener—AdGuard is one—leave every tab holding the
+    // snapshot it read at load time. Writing that snapshot back wholesale is what makes
+    // history appear to vanish: the longest-open tab overwrites everything the other tabs
+    // recorded in the meantime. So state is never replaced, only merged: newest timestamp
+    // wins per URL, and removals are recorded as timestamps of their own (a per-URL
+    // tombstone, or `resetAt` for a full clear) so that merging cannot resurrect them.
+    function mergeStoredState(stored, { adoptSettings = false } = {}) {
+        if (!stored || typeof stored !== 'object') return false;
+
+        const remoteVisited = parseVisited(stored.visited);
+        const remoteOverrides = parseOverrides(stored.overrides);
+        const remoteOverrideTimes = parseTimestamps(stored.overrideTimes);
+        const remoteTombstones = parseTimestamps(stored.tombstones);
+        const remoteReset = parseTimestamp(stored.resetAt);
+        const remoteUpdatedAt = parseTimestamp(stored.updatedAt);
+        let changed = false;
+
+        if (remoteReset > resetAt) {
+            resetAt = remoteReset;
+            for (const [url, at] of visited) {
+                if (at <= resetAt) {
+                    visited.delete(url);
+                    changed = true;
+                }
+            }
         }
+
+        for (const [key, at] of remoteTombstones) {
+            if (at <= (tombstones.get(key) || 0)) continue;
+            tombstones.set(key, at);
+            const url = key.slice(2);
+            if (key.startsWith('v|')) {
+                if (visited.has(url) && visited.get(url) <= at) {
+                    visited.delete(url);
+                    changed = true;
+                }
+            } else if (key.startsWith('o|')) {
+                if (overrides.has(url) && (overrideTimes.get(url) || 0) <= at) {
+                    overrides.delete(url);
+                    overrideTimes.delete(url);
+                    changed = true;
+                }
+            }
+        }
+
+        for (const [url, at] of remoteVisited) {
+            if (at <= resetAt || at <= tombstoneTime('v', url)) continue;
+            if (at <= (visited.get(url) || 0)) continue;
+            visited.set(url, at);
+            changed = true;
+        }
+
+        for (const [url, value] of remoteOverrides) {
+            const at = remoteOverrideTimes.get(url) || 0;
+            if (at < tombstoneTime('o', url)) continue;
+            if (at < (overrideTimes.get(url) || 0)) continue;
+            if (overrides.get(url) === value) continue;
+            overrides.set(url, value);
+            overrideTimes.set(url, at);
+            changed = true;
+        }
+
+        if (adoptSettings && remoteUpdatedAt > lastKnownUpdatedAt) {
+            const remoteSettings = sanitizeSettings(stored.settings);
+            if (JSON.stringify(remoteSettings) !== JSON.stringify(settings)) {
+                settings = remoteSettings;
+                changed = true;
+            }
+        }
+
+        lastKnownUpdatedAt = Math.max(lastKnownUpdatedAt, remoteUpdatedAt);
+        return changed;
+    }
+
+    // Writes are queued so two read-merge-write cycles can never interleave and drop each
+    // other's changes on engines where GM_setValue resolves asynchronously.
+    function persistState() {
+        writeQueue = writeQueue.then(() => writeStoredState(), () => writeStoredState());
+        return writeQueue;
+    }
+
+    async function writeStoredState() {
+        const startedAt = Date.now();
+        for (let attempt = 0; attempt < 2; attempt += 1) {
+            try {
+                mergeStoredState(await readStoredState());
+                pruneVisited();
+                const payload = serializeState();
+                await Promise.resolve(GM_setValue(STORAGE_KEY, payload));
+                // Read back rather than trusting the write: a value that never landed is
+                // exactly the failure that used to go unnoticed until the history was gone.
+                const verified = await Promise.resolve(GM_getValue(STORAGE_KEY, null));
+                if (!verified || typeof verified !== 'object'
+                    || parseTimestamp(verified.updatedAt) < payload.updatedAt) {
+                    throw new Error('Stored state did not come back after writing.');
+                }
+                lastKnownUpdatedAt = payload.updatedAt;
+                lastSavedAt = Date.now();
+                lastSaveFailed = false;
+                storageAvailable = true;
+                clearPendingVisits(startedAt);
+                scheduleCountUpdate();
+                return true;
+            } catch (error) {
+                if (attempt === 0) {
+                    await new Promise(resolve => window.setTimeout(resolve, 300));
+                    continue;
+                }
+                storageAvailable = false;
+                lastSaveFailed = true;
+                console.warn('[JVS] Could not save settings or visited history.', error);
+                showToast('Could not save—userscript storage rejected the write.', true);
+                scheduleCountUpdate();
+                return false;
+            }
+        }
+        return false;
+    }
+
+    // A click starts a navigation, and on AdGuard the GM write that records it is
+    // asynchronous, so the page can unload before the value ever reaches storage. Each
+    // click is therefore also parked in sessionStorage—synchronous, and it survives the
+    // navigation—and replayed on the next JavStore page load in that tab. sessionStorage is
+    // readable by the site, so the note holds only URLs whose real write is still in
+    // flight, it is dropped as soon as that write lands, and it can be switched off.
+    function readPendingVisits() {
+        try {
+            const raw = sessionStorage.getItem(PENDING_VISITS_KEY);
+            const parsed = raw ? JSON.parse(raw) : [];
+            if (!Array.isArray(parsed)) return [];
+            return parsed
+                .map(entry => ({ url: normalizeUrl(entry?.url), at: parseTimestamp(entry?.at) }))
+                .filter(entry => entry.url && entry.at);
+        } catch (error) {
+            return [];
+        }
+    }
+
+    function writePendingVisits(entries) {
+        try {
+            if (!entries.length) {
+                sessionStorage.removeItem(PENDING_VISITS_KEY);
+                return;
+            }
+            const payload = entries
+                .slice(-MAX_PENDING_VISITS)
+                .map(entry => ({ url: entry.url, at: entry.at }));
+            sessionStorage.setItem(PENDING_VISITS_KEY, JSON.stringify(payload));
+        } catch (error) {
+            // Private windows and blocked site data are fine; the GM write still runs.
+        }
+    }
+
+    function rememberPendingVisit(url, at) {
+        if (!settings.fastNavigationSafety) return;
+        const entries = readPendingVisits().filter(entry => entry.url !== url);
+        entries.push({ url, at });
+        writePendingVisits(entries);
+    }
+
+    function clearPendingVisits(savedAt) {
+        const entries = readPendingVisits().filter(entry => entry.at > savedAt);
+        writePendingVisits(entries);
+    }
+
+    function replayPendingVisits() {
+        const entries = readPendingVisits();
+        if (!entries.length) return false;
+        writePendingVisits([]);
+        if (!settings.trackVisited) return false;
+        let changed = false;
+        entries.forEach(({ url, at }) => {
+            if (at <= resetAt || at <= tombstoneTime('v', url)) return;
+            if (at <= (visited.get(url) || 0)) return;
+            visited.set(url, at);
+            changed = true;
+        });
+        return changed;
+    }
+
+    // Landing on a detail page is the visit the click-time write races against, so treat
+    // arriving there as evidence in its own right: no cards on the page plus a JavStore
+    // referrer means a card link brought the user here, whatever happened to that write.
+    function recordCurrentPageVisit() {
+        if (!settings.trackVisited) return false;
+        if (location.pathname === '/' || NON_ITEM_PATH.test(location.pathname)) return false;
+        let referrer;
+        try {
+            referrer = new URL(document.referrer);
+        } catch (error) {
+            return false;
+        }
+        if (referrer.hostname !== location.hostname) return false;
+        if (collectCards(document).length) return false;
+
+        const url = normalizeUrl(location.href);
+        const now = Date.now();
+        if ((visited.get(url) || 0) >= now) return false;
+        visited.set(url, now);
+        tombstones.delete(tombstoneKey('v', url));
+        return true;
     }
 
     async function migrateLegacyHistory() {
@@ -229,11 +467,27 @@
                 .slice(0, visited.size - MAX_VISITED_ITEMS)
                 .forEach(([url]) => visited.delete(url));
         }
+
+        // Tombstones only need to outlive the stale snapshots they protect against.
+        for (const [key, at] of tombstones) {
+            if (now - at > TOMBSTONE_TTL_MS) tombstones.delete(key);
+        }
+        if (tombstones.size > MAX_TOMBSTONES) {
+            [...tombstones.entries()]
+                .sort((a, b) => a[1] - b[1])
+                .slice(0, tombstones.size - MAX_TOMBSTONES)
+                .forEach(([key]) => tombstones.delete(key));
+        }
+        for (const url of overrideTimes.keys()) {
+            if (!overrides.has(url)) overrideTimes.delete(url);
+        }
     }
 
     settings = sanitizeSettings();
     visited = new Map();
     overrides = new Map();
+    overrideTimes = new Map();
+    tombstones = new Map();
 
     function setRootState() {
         const root = document.documentElement;
@@ -519,8 +773,14 @@
     function markVisited(card, shouldVisit = true) {
         if (!settings.trackVisited || !card) return;
         const url = normalizeUrl(card.href);
-        if (shouldVisit) visited.set(url, Date.now());
-        else visited.delete(url);
+        const now = Date.now();
+        if (shouldVisit) {
+            visited.set(url, now);
+            tombstones.delete(tombstoneKey('v', url));
+            rememberPendingVisit(url, now);
+        } else {
+            forgetVisited(url, now);
+        }
         pruneVisited();
         processCard(card);
         persistState();
@@ -537,9 +797,14 @@
         if (!card) return;
         const url = normalizeUrl(card.href);
         const current = overrides.get(url);
-        if (!current) overrides.set(url, 'allow');
-        else if (current === 'allow') overrides.set(url, 'block');
-        else overrides.delete(url);
+        const now = Date.now();
+        if (!current || current === 'allow') {
+            overrides.set(url, current ? 'block' : 'allow');
+            overrideTimes.set(url, now);
+            tombstones.delete(tombstoneKey('o', url));
+        } else {
+            forgetOverride(url, now);
+        }
         persistState();
         processCard(card);
         updateSelectedCardUi();
@@ -678,11 +943,21 @@
         };
     }
 
+    function describeSaveState() {
+        if (lastSaveFailed) return 'last save failed';
+        if (!lastSavedAt) return 'nothing saved yet this page';
+        const minutes = Math.floor((Date.now() - lastSavedAt) / 60000);
+        if (minutes < 1) return 'saved just now';
+        if (minutes < 60) return `saved ${minutes} min ago`;
+        return `saved at ${new Date(lastSavedAt).toLocaleTimeString()}`;
+    }
+
     function updateCounts() {
         if (!ui) return;
         const counts = getCounts();
+        const capped = counts.stored >= MAX_VISITED_ITEMS ? ' (cap reached—oldest are dropped)' : '';
         ui.summary.textContent = `${counts.matched} matched · ${counts.visited} visited`;
-        ui.counts.textContent = `${counts.total} cards on this page · ${counts.stored} visited URLs stored`;
+        ui.counts.textContent = `${counts.total} cards on this page · ${counts.stored} visited URLs stored${capped} · ${describeSaveState()}`;
     }
 
     function showToast(message, isError = false) {
@@ -716,6 +991,7 @@
             recoverDuration: ui.form.elements.recoverDuration.value,
             toggleKey: ui.form.elements.toggleKey.value,
             trackVisited: ui.form.elements.trackVisited.checked,
+            fastNavigationSafety: ui.form.elements.fastNavigationSafety.checked,
             visitedOpacity: ui.form.elements.visitedOpacity.value,
             retentionDays: ui.form.elements.retentionDays.value,
             hideSidebar: ui.form.elements.hideSidebar.checked,
@@ -738,6 +1014,7 @@
         elements.recoverDuration.value = settings.recoverDuration;
         elements.toggleKey.value = settings.toggleKey;
         elements.trackVisited.checked = settings.trackVisited;
+        elements.fastNavigationSafety.checked = settings.fastNavigationSafety;
         elements.visitedOpacity.value = settings.visitedOpacity;
         elements.retentionDays.value = settings.retentionDays;
         elements.hideSidebar.checked = settings.hideSidebar;
@@ -797,8 +1074,13 @@
             if (!parsed || typeof parsed !== 'object') throw new Error('Invalid backup');
             if (!window.confirm('Replace current settings, history, and per-card overrides with this backup?')) return;
             settings = sanitizeSettings(parsed.settings);
+            resetAt = Date.now();
             visited = parseVisited(parsed.visited);
             overrides = parseOverrides(parsed.overrides);
+            overrideTimes = parseTimestamps(parsed.overrideTimes);
+            for (const key of tombstones.keys()) {
+                if (key.startsWith('v|')) tombstones.delete(key);
+            }
             pruneVisited();
             persistState();
             setRootState();
@@ -921,6 +1203,7 @@
                     <div class="grid">
                         <label class="check"><input name="hideSidebar" type="checkbox"> Hide sidebar</label>
                         <label class="check"><input name="trackVisited" type="checkbox"> Track visited cards</label>
+                        <label class="check" title="Keeps a short-lived, per-tab note of clicks the userscript manager has not stored yet, so a visit is not lost when the page unloads mid-save."><input name="fastNavigationSafety" type="checkbox"> Fast-navigation safety net</label>
                         <label>Reveal delay (ms) <input name="revealDelay" type="number" min="0" max="5000" step="100"></label>
                         <label>Reveal duration (ms) <input name="revealDuration" type="number" min="0" max="5000" step="100"></label>
                         <label>Recovery duration (ms) <input name="recoverDuration" type="number" min="0" max="2000" step="50"></label>
@@ -1000,7 +1283,11 @@
         });
         shadow.querySelector('.clear').addEventListener('click', () => {
             if (!window.confirm(`Clear all ${visited.size} visited URLs? This cannot be undone unless you exported a backup.`)) return;
+            resetAt = Date.now();
             visited.clear();
+            for (const key of tombstones.keys()) {
+                if (key.startsWith('v|')) tombstones.delete(key);
+            }
             persistState();
             processAllCards();
             showToast('Visited history cleared.');
@@ -1014,17 +1301,26 @@
         ui.open = () => setPanelOpen(true);
     }
 
-    function reloadRemoteState(newValue) {
-        if (!newValue || typeof newValue !== 'object') return;
-        settings = sanitizeSettings(newValue.settings);
-        visited = parseVisited(newValue.visited);
-        overrides = parseOverrides(newValue.overrides);
+    function applyStoredState(stored) {
+        if (!mergeStoredState(stored, { adoptSettings: true })) return false;
         pruneVisited();
         setRootState();
         processAllCards();
         fillSettingsForm();
         updateUi();
-        showToast('Settings synchronized from another tab.');
+        return true;
+    }
+
+    function reloadRemoteState(newValue) {
+        if (applyStoredState(newValue)) showToast('Settings synchronized from another tab.');
+    }
+
+    // Stand-in for GM_addValueChangeListener on engines that do not provide it: re-read and
+    // merge whenever this tab comes back to the foreground, so its next write is not built
+    // on a snapshot that other tabs have since moved past.
+    async function refreshFromStorage() {
+        if (document.visibilityState === 'hidden') return;
+        applyStoredState(await readStoredState());
     }
 
     function onReady() {
@@ -1032,6 +1328,11 @@
         createUi();
         processAllCards();
         observeDynamicContent();
+
+        if (recordCurrentPageVisit()) {
+            processAllCards();
+            persistState();
+        }
 
         document.addEventListener('click', onDocumentClick, true);
         document.addEventListener('auxclick', onAuxClick, true);
@@ -1048,14 +1349,25 @@
             const card = event.target instanceof Element ? event.target.closest('a.jvs-card') : null;
             if (card) setSelectedCard(card);
         }, true);
-        window.addEventListener('pageshow', () => processAllCards());
+        window.addEventListener('pageshow', () => {
+            processAllCards();
+            refreshFromStorage();
+        });
+        window.addEventListener('focus', refreshFromStorage);
+        document.addEventListener('visibilitychange', refreshFromStorage);
 
+        let liveSync = false;
         try {
             GM_addValueChangeListener(STORAGE_KEY, (_name, _oldValue, newValue, remote) => {
                 if (remote) reloadRemoteState(newValue);
             });
+            liveSync = true;
         } catch (error) {
-            console.warn('[JVS] Cross-tab synchronization is unavailable.', error);
+            console.warn('[JVS] Cross-tab change notifications are unavailable.', error);
+        }
+        if (!liveSync) {
+            syncTimer = window.setInterval(refreshFromStorage, SYNC_POLL_MS);
+            window.addEventListener('pagehide', () => window.clearInterval(syncTimer));
         }
 
         try {
@@ -1071,8 +1383,14 @@
         settings = sanitizeSettings(initialState?.settings);
         visited = parseVisited(initialState?.visited);
         overrides = parseOverrides(initialState?.overrides);
+        overrideTimes = parseTimestamps(initialState?.overrideTimes);
+        tombstones = parseTimestamps(initialState?.tombstones);
+        resetAt = parseTimestamp(initialState?.resetAt);
+        lastKnownUpdatedAt = parseTimestamp(initialState?.updatedAt);
+        const replayed = replayPendingVisits();
         pruneVisited();
         await migrateLegacyHistory();
+        if (replayed) persistState();
         setRootState();
 
         if (document.readyState === 'loading') {
