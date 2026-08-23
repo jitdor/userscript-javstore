@@ -17,10 +17,13 @@ A Tampermonkey userscript that cleans up JavStore's layout, protects keyword-mat
 - Tracks visited cards with configurable retention and a 5,000-item cap.
 - Filters the page to all, unvisited, visited, or matched cards.
 - Reveals individual cards temporarily or toggles protection globally.
-- Synchronizes settings and history across tabs when supported by the userscript manager.
+- Synchronizes settings and history across tabs, merging rather than overwriting, and falls back to polling when the userscript manager cannot notify tabs of changes.
+- Replays clicks whose save was interrupted by the page unloading, and records a visit when a detail page is opened from JavStore.
 - Imports and exports settings, visited history, and per-card overrides as a JSON backup.
 
 All settings and visited history stay in the userscript manager's local storage. The script does not send that data to an external service.
+
+With "Fast-navigation safety net" enabled (the default), a click is also written to `sessionStorage` until the userscript manager confirms it stored the visit. That note lives in the tab only, holds nothing beyond the URL currently being opened, is removed as soon as the real save lands, and can be switched off in the settings panel.
 
 ## Controls
 
@@ -34,10 +37,14 @@ All settings and visited history stay in the userscript manager's local storage.
 
 - Target: `https://javstore.net/*`
 - Run timing: `document-start`
-- Required userscript APIs: `GM_addStyle`, `GM_getValue`, `GM_setValue`, `GM_addValueChangeListener`, and `GM_registerMenuCommand`
+- Required userscript APIs: `GM_addStyle`, `GM_getValue`, `GM_setValue`
+- Optional userscript APIs: `GM_addValueChangeListener` and `GM_registerMenuCommand`. AdGuard does not implement either; the script polls for changes instead of being notified, and its own on-page control replaces the manager menu.
+- `GM_getValue`/`GM_setValue` are supported in both the synchronous Tampermonkey style and the asynchronous GM4 style AdGuard uses.
 
 The script depends on JavStore's current page structure. If the site changes, please [open an issue](https://github.com/jitdor/userscript-javstore/issues).
 
 ## Development
 
 The distributable is [`javstore-full-layout-cleanup.user.js`](./javstore-full-layout-cleanup.user.js). Keep the userscript header version and the internal `SCRIPT_VERSION` value in sync for every release.
+
+`npm install && npm test` runs the storage-persistence suite. It loads the userscript into jsdom windows that share one asynchronous value store with no change notifications—an AdGuard-shaped engine—and asserts that history survives reloads, concurrent tabs, interrupted saves, and explicit removals.
