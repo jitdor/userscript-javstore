@@ -47,4 +47,6 @@ The script depends on JavStore's current page structure. If the site changes, pl
 
 The distributable is [`javstore-full-layout-cleanup.user.js`](./javstore-full-layout-cleanup.user.js). Keep the userscript header version and the internal `SCRIPT_VERSION` value in sync for every release.
 
+Releases publish themselves: a push to `main` whose `@version` header names a version with no release yet runs the tests and publishes that release, which is what `@updateURL`/`@downloadURL` point at. A push that does not bump the header is a no-op, so releasing a change means bumping `@version` and `SCRIPT_VERSION` and adding the matching `## <version>` section to `CHANGELOG.md` in the same pull request. The workflow can still be run manually to release from a branch.
+
 `npm install && npm test` runs the storage-persistence suite. It loads the userscript into jsdom windows that share one asynchronous value store with no change notifications—an AdGuard-shaped engine—and asserts that history survives reloads, concurrent tabs, interrupted saves, and explicit removals.
