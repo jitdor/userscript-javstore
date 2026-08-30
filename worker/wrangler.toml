@@ -2,6 +2,17 @@ name = "javstore-sync"
 main = "src/worker.mjs"
 compatibility_date = "2025-01-01"
 
+# No javstore-sync.<subdomain>.workers.dev URL. workers.dev subdomains are guessable, and
+# the history behind this one is worth not advertising, so the worker is reachable only on a
+# route you configure below. Deploying with this off and no route leaves it unreachable —
+# comment it back out, or add the route, before deploying.
+workers_dev = false
+
+# The custom domain the worker answers on. Its zone has to be on the same Cloudflare account.
+# routes = [
+#     { pattern = "sync.example.com", custom_domain = true },
+# ]
+
 # One object holds the whole history in its own SQLite database. Being single-threaded is
 # the point: it makes each sync's read-merge-write strongly consistent.
 [[durable_objects.bindings]]
