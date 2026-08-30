@@ -1,5 +1,16 @@
 # Changelog
 
+## 6.2.0
+
+- Add: optional cloud sync. Settings, visited history, and per-card overrides can be mirrored to a Cloudflare Worker you deploy yourself (`worker/`), so history survives a userscript-manager reinstall and follows you between devices. Configure the endpoint and token under "Cloud sync" in the settings panel; sync is off until you do.
+- Sync never replaces, it merges—on the worker as well as locally. A device pushes its whole document and gets the merged result back, so a device that has been offline cannot overwrite what the others recorded, an unmarked item is not resurrected, and "Clear visited history" propagates instead of being undone.
+- The endpoint and token are stored per device, outside the synchronized document: they are never uploaded to the worker and never appear in an exported backup.
+- The access token is never placed in the page: the settings panel lives in a shadow root the site's own scripts can read, so the token box stays empty and only reports whether a token is stored.
+- A sync that changes nothing does not write to the KV namespace, so ordinary page loads cost a read and nothing else.
+- Add: retention pruning now travels with the document as a cutoff, so expired entries are not handed back by another device.
+- Fix: settings carry their own timestamp, so an empty store—or a device that has never changed a setting—can no longer reset another device to the defaults.
+- Fix: the 5,000-item cap drops the same entries everywhere (oldest first, URL breaking a tie) rather than each store keeping a different 5,000.
+
 ## 6.1.0
 
 - Fix: visited history could disappear after a while on engines without `GM_addValueChangeListener` (AdGuard among them). Every tab kept the snapshot it read at load time and wrote it back wholesale, so the longest-open tab silently overwrote everything the other tabs had recorded. State is now merged rather than replaced on every write: newest timestamp wins per URL, writes are queued so two save cycles cannot interleave, and removals are recorded as timestamps (per-URL tombstones, plus a reset marker for "Clear visited history") so a merge can never resurrect them.
