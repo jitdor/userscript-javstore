@@ -2,15 +2,26 @@ name = "javstore-sync"
 main = "src/worker.mjs"
 compatibility_date = "2025-01-01"
 
-# Created with: npx wrangler kv namespace create JAVSTORE_SYNC
-# Paste the id it prints below.
-[[kv_namespaces]]
-binding = "JAVSTORE_SYNC"
-id = "REPLACE_WITH_YOUR_KV_NAMESPACE_ID"
+# One object holds the whole history in its own SQLite database. Being single-threaded is
+# the point: it makes each sync's read-merge-write strongly consistent.
+[[durable_objects.bindings]]
+name = "SYNC_STORE"
+class_name = "SyncStore"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["SyncStore"]
 
 [vars]
 # Browsers only enforce this when the userscript falls back to fetch; GM_xmlhttpRequest
 # ignores CORS. Set it to "*" if you also sync from another origin.
 ALLOWED_ORIGIN = "https://javstore.net"
+
+# Upgrading from the KV-backed version (6.2.0)? Uncomment this with your namespace id and
+# deploy: the worker imports that document once, and you can then remove both the binding
+# and the namespace.
+# [[kv_namespaces]]
+# binding = "JAVSTORE_SYNC"
+# id = "YOUR_OLD_KV_NAMESPACE_ID"
 
 # SYNC_TOKEN is a secret, not a var: npx wrangler secret put SYNC_TOKEN

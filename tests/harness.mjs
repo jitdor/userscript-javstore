@@ -1,5 +1,6 @@
 import { JSDOM, VirtualConsole } from 'jsdom';
-import worker from '../worker/src/worker.mjs';
+import worker, { SyncStore } from '../worker/src/worker.mjs';
+import { DatabaseSync } from 'node:sqlite';
 import vm from 'node:vm';
 import fs from 'node:fs';
 import path from 'node:path';
@@ -34,47 +35,66 @@ export function makeStore() {
     };
 }
 
-// The sync backend under test is the real worker, driven through a Map that stands in for
-// the KV namespace, so the tests exercise both halves of a sync rather than a mock of one.
-function makeKv() {
-    const data = new Map();
-    const kv = {
-        data,
-        writes: 0,
-        async get(key, type) {
-            const raw = data.get(key);
-            if (raw === undefined) return null;
-            return type === 'json' ? JSON.parse(raw) : raw;
-        },
-        async put(key, value) {
-            kv.writes += 1;
-            data.set(key, String(value));
+// The sync backend under test is the real worker: its Durable Object class runs against a
+// node:sqlite database standing in for `ctx.storage.sql`, which has the same synchronous
+// exec-and-iterate shape. That keeps the tests fast while exercising the actual SQL.
+function makeSqlStorage() {
+    const db = new DatabaseSync(':memory:');
+    return {
+        db,
+        exec(query, ...bindings) {
+            const rows = db.prepare(query).all(...bindings);
+            return {
+                toArray: () => rows,
+                one: () => rows[0],
+                [Symbol.iterator]: () => rows[Symbol.iterator](),
+            };
         },
     };
-    return kv;
 }
 
-export function makeRemote({ token = 'test-token', origin = 'https://sync.test' } = {}) {
-    const kv = makeKv();
+export function makeRemote({
+    token = 'test-token',
+    origin = 'https://sync.test',
+    legacyDocument = null,
+} = {}) {
+    const storage = makeSqlStorage();
+    const env = { SYNC_TOKEN: token, ALLOWED_ORIGIN: '*' };
+    if (legacyDocument) {
+        env.JAVSTORE_SYNC = { get: async () => legacyDocument };
+    }
+    const store = new SyncStore({ storage: { sql: storage.sql ?? storage } }, env);
+    env.SYNC_STORE = {
+        idFromName: name => ({ name }),
+        get: () => ({ fetch: request => store.fetch(request) }),
+    };
+
     const remote = {
-        kv,
+        store,
+        env,
         token,
         endpoint: `${origin}/state`,
         offline: false,
         requests: [],
-        env: { SYNC_TOKEN: token, JAVSTORE_SYNC: kv, ALLOWED_ORIGIN: '*' },
         async handle({ method, url, headers, body }) {
             if (remote.offline) throw new Error('network unreachable');
-            remote.requests.push({ method, url, headers, body });
-            const response = await worker.fetch(new Request(url, { method, headers, body }), remote.env);
+            remote.requests.push({ method, url, headers, body: body ? JSON.parse(body) : null });
+            const response = await worker.fetch(new Request(url, { method, headers, body }), env);
             return { status: response.status, statusText: '', text: await response.text() };
         },
         state() {
-            const raw = kv.data.get('state');
-            return raw ? JSON.parse(raw) : null;
+            return store.document();
         },
         visited() {
-            return Object.keys(remote.state()?.visited || {}).sort();
+            return Object.keys(store.document().visited).sort();
+        },
+        rows() {
+            return storage.db.prepare('SELECT kind, key, at, deleted, seq FROM entries ORDER BY seq').all();
+        },
+        // What the last sync actually cost on the wire, for the delta-size assertions.
+        lastPushedChanges() {
+            const last = remote.requests.at(-1)?.body;
+            return Array.isArray(last?.changes) ? last.changes : [];
         },
     };
     return remote;
@@ -136,8 +156,12 @@ export async function openTab(store, {
     window.GM_addStyle = () => {};
     window.confirm = () => true;
     if (remote) {
+        // A tab may be able to reach more than one worker (the panel can be repointed at a
+        // different endpoint), so requests are routed by the URL they were sent to.
+        const remotes = Array.isArray(remote) ? remote : [remote];
         window.GM_xmlhttpRequest = ({ method, url, headers, data, onload, onerror }) => {
-            remote.handle({ method, url, headers, body: data })
+            const target = remotes.find(candidate => url.startsWith(candidate.endpoint)) || remotes[0];
+            target.handle({ method, url, headers, body: data })
                 .then(response => onload({
                     status: response.status,
                     statusText: response.statusText,

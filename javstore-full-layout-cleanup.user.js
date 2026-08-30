@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         JavStore Full Layout Cleanup - No Sidebars + Mosaic Overlay
 // @namespace    http://tampermonkey.net/
-// @version      6.2.0
+// @version      6.3.0
 // @description  Clean up JavStore's layout, filter keyword-matched thumbnails, and track visited items with private, configurable controls.
 // @homepageURL  https://github.com/jitdor/userscript-javstore
 // @supportURL   https://github.com/jitdor/userscript-javstore/issues
@@ -21,7 +21,7 @@
 (function () {
     'use strict';
 
-    const SCRIPT_VERSION = '6.2.0';
+    const SCRIPT_VERSION = '6.3.0';
     const STORAGE_VERSION = 3;
     const STORAGE_KEY = 'javstore_cleanup_state_v2';
     const LEGACY_STORAGE_KEY = 'javstore_seen_links';
@@ -38,6 +38,8 @@
     const REMOTE_PUSH_DEBOUNCE_MS = 4000;
     const REMOTE_REFRESH_MIN_GAP_MS = 60000;
     const REMOTE_TIMEOUT_MS = 20000;
+    const REMOTE_PAGE_ROWS = 1000;
+    const MAX_SYNC_PAGES = 12;
     const NON_ITEM_PATH = /^\/(?:page|search|tag|tags|category|categories|login|logout|register|profile|user|feed|rss)(?:\/|$)/i;
     const CARD_SELECTOR = 'main .grid a[href]';
 
@@ -67,6 +69,12 @@
         endpoint: '',
         token: '',
         intervalMinutes: 5,
+        // Where this device is up to with the worker. Local to the device, like the
+        // credentials: `cursor` is the last sequence number it has seen, `pushedAt` the
+        // moment of its last successful push, and `remoteKey` the endpoint both belong to.
+        cursor: 0,
+        pushedAt: 0,
+        remoteKey: '',
     });
 
     const VALID_MODES = new Set(['tint', 'blur', 'hide']);
@@ -547,12 +555,15 @@
     //
     // The userscript manager's own storage is the working copy, but it is the thing that
     // keeps disappearing: AdGuard drops it on some upgrades, and it never leaves the
-    // device. So the same document is also mirrored to a Cloudflare Worker that the user
-    // owns. Every sync is a single request that hands the worker this device's whole
-    // document and gets the merged result back, using the same rules as the local merge
-    // (newest timestamp per URL wins, tombstones and `resetAt`/`prunedBefore` outrank a
-    // stale entry). Because each device pushes its full state on every sync, a write the
-    // worker's storage happens to lose is restored by the next sync rather than lost.
+    // device. So the same history is also mirrored to a Cloudflare Worker that the user
+    // owns, where a Durable Object holds it in SQLite.
+    //
+    // Devices exchange deltas. This one remembers the sequence number it last saw, asks for
+    // everything recorded after it, and pushes only the entries it has touched since its
+    // last successful push—so an ordinary page load costs a few hundred bytes rather than
+    // the whole history. What comes back is folded in by the same merge that handles other
+    // tabs: newest timestamp per URL wins, and tombstones and `resetAt`/`prunedBefore`
+    // outrank a stale entry.
     // ------------------------------------------------------------------
 
     // Visited history is the payload, so it has to be encrypted in transit. Plain http is
@@ -576,6 +587,9 @@
             endpoint: isSyncEndpoint(endpoint) ? endpoint : '',
             token: String(candidate.token || '').trim().slice(0, 500),
             intervalMinutes: clamp(candidate.intervalMinutes, 1, 1440, DEFAULT_SYNC_CONFIG.intervalMinutes),
+            cursor: clamp(candidate.cursor, 0, Number.MAX_SAFE_INTEGER, 0),
+            pushedAt: parseTimestamp(candidate.pushedAt),
+            remoteKey: String(candidate.remoteKey || '').slice(0, 500),
         };
     }
 
@@ -652,6 +666,66 @@
         });
     }
 
+    // The entries this device has touched since its last successful push. Everything
+    // recorded locally is stamped with the current time, so a single high-water mark is
+    // enough to find them—and entries that arrived from the worker are always older than
+    // it, so they are never sent straight back.
+    function localChangesSince(since) {
+        const changes = [];
+        for (const [url, at] of visited) {
+            if (at >= since) changes.push({ kind: 'v', key: url, at });
+        }
+        for (const [key, at] of tombstones) {
+            if (at < since) continue;
+            changes.push({ kind: key.startsWith('o|') ? 'o' : 'v', key: key.slice(2), at, deleted: 1 });
+        }
+        for (const [url, value] of overrides) {
+            const at = overrideTimes.get(url) || 0;
+            if (at >= since) changes.push({ kind: 'o', key: url, at, value });
+        }
+        return changes.sort((a, b) => a.at - b.at);
+    }
+
+    function localMeta() {
+        return { resetAt, prunedBefore, settings: { ...settings }, settingsUpdatedAt };
+    }
+
+    // Rows come back in the delta shape; turning them into a document lets the merge that
+    // already handles cross-tab state handle them too, rather than repeating its rules.
+    function documentFromRows(rows, meta) {
+        const visitedRows = {};
+        const overrideRows = {};
+        const overrideTimeRows = {};
+        const tombstoneRows = {};
+        (Array.isArray(rows) ? rows : []).forEach(row => {
+            if (!row || typeof row !== 'object') return;
+            const kind = row.kind === 'o' ? 'o' : 'v';
+            const key = String(row.key || '');
+            const at = parseTimestamp(row.at);
+            if (!key || !at) return;
+            if (row.deleted) {
+                tombstoneRows[`${kind}|${key}`] = at;
+            } else if (kind === 'v') {
+                visitedRows[key] = at;
+            } else if (row.value === 'allow' || row.value === 'block') {
+                overrideRows[key] = row.value;
+                overrideTimeRows[key] = at;
+            }
+        });
+        const safeMeta = meta && typeof meta === 'object' ? meta : {};
+        return {
+            updatedAt: 0,
+            resetAt: safeMeta.resetAt,
+            prunedBefore: safeMeta.prunedBefore,
+            settings: safeMeta.settings,
+            settingsUpdatedAt: parseTimestamp(safeMeta.settingsUpdatedAt),
+            visited: visitedRows,
+            overrides: overrideRows,
+            overrideTimes: overrideTimeRows,
+            tombstones: tombstoneRows,
+        };
+    }
+
     // Syncs are queued for the same reason writes are: two overlapping merge cycles would
     // each build on a snapshot the other has already moved past.
     function queueSync(options = {}) {
@@ -666,24 +740,64 @@
         remoteSyncRunning = true;
         scheduleCountUpdate();
         try {
-            // Let any local write finish first so the document being pushed is the current one.
+            // Let any local write finish first so what gets pushed is the current state.
             await writeQueue.catch(() => false);
             pruneVisited();
-            const answer = await requestRemote({ client: SCRIPT_VERSION, state: serializeState() });
-            const remoteState = answer && typeof answer === 'object'
-                ? (answer.state && typeof answer.state === 'object' ? answer.state : answer)
-                : null;
-            if (!remoteState || typeof remoteState !== 'object') {
-                throw new Error('the worker returned no state');
+
+            // The cursor and the high-water mark only mean anything against the worker they
+            // were recorded from, so pointing the panel at a different one starts over.
+            const sameRemote = syncConfig.remoteKey === syncConfig.endpoint;
+            let cursor = sameRemote ? syncConfig.cursor : 0;
+            const pushedAt = sameRemote ? syncConfig.pushedAt : 0;
+
+            const horizon = Date.now();
+            let outgoing = localChangesSince(pushedAt);
+            let changed = false;
+            let legacy = false;
+
+            for (let page = 0; page < MAX_SYNC_PAGES; page += 1) {
+                const batch = outgoing.slice(0, REMOTE_PAGE_ROWS);
+                const answer = await requestRemote({
+                    client: SCRIPT_VERSION,
+                    cursor,
+                    limit: REMOTE_PAGE_ROWS,
+                    meta: localMeta(),
+                    changes: batch,
+                });
+                if (!answer || typeof answer !== 'object') {
+                    throw new Error('the worker returned nothing');
+                }
+                // A worker still running the document-only version answers with a whole
+                // document and no cursor. Fall back to that exchange rather than silently
+                // pulling from it without ever pushing.
+                if (answer.state && typeof answer.state === 'object' && answer.cursor === undefined) {
+                    legacy = true;
+                    const echoed = await requestRemote({ client: SCRIPT_VERSION, state: serializeState() });
+                    const document = echoed?.state && typeof echoed.state === 'object' ? echoed.state : answer.state;
+                    if (applyStoredState(document)) changed = true;
+                    break;
+                }
+
+                outgoing = outgoing.slice(batch.length);
+                cursor = Math.max(0, Number(answer.cursor) || 0);
+                applyingRemoteState = true;
+                if (applyStoredState(documentFromRows(answer.changes, answer.meta))) changed = true;
+                applyingRemoteState = false;
+                if (!outgoing.length && !answer.more) break;
             }
 
-            // The flag stays up across the write that follows: what the merge produced is
-            // exactly what the worker already holds, so pushing it straight back would only
-            // make every pull cost a second request.
-            applyingRemoteState = true;
-            const changed = applyStoredState(remoteState);
+            // Only recorded after the exchange succeeded: a failed sync has to send the same
+            // entries again rather than assume the worker took them.
+            await writeSyncConfig({
+                ...syncConfig,
+                cursor: legacy ? 0 : cursor,
+                pushedAt: legacy ? 0 : horizon,
+                remoteKey: legacy ? '' : syncConfig.endpoint,
+            });
+
             lastRemoteSyncAt = Date.now();
             lastRemoteError = '';
+            applyingRemoteState = true;
             if (changed) await persistState();
             if (manual) showToast(changed ? 'Synced. Remote history merged in.' : 'Synced. Nothing new.');
             return changed;
@@ -1275,6 +1389,11 @@
         const elements = ui.syncForm.elements;
         const typed = String(elements.syncToken.value || '').trim();
         return sanitizeSyncConfig({
+            // Saving the panel is not a reason to forget where this device is up to; the
+            // cursor is discarded only when it turns out to belong to a different worker.
+            cursor: syncConfig.cursor,
+            pushedAt: syncConfig.pushedAt,
+            remoteKey: syncConfig.remoteKey,
             enabled: elements.syncEnabled.checked,
             endpoint: elements.syncEndpoint.value,
             // An empty box means "keep the token already stored"—it is deliberately never
@@ -1348,7 +1467,11 @@
 
     async function importState(file) {
         try {
-            const parsed = JSON.parse(await file.text());
+            const raw = JSON.parse(await file.text());
+            // A backup taken straight from the worker (`GET /state`) is wrapped in `state`.
+            const parsed = raw && typeof raw === 'object' && raw.state && typeof raw.state === 'object'
+                ? raw.state
+                : raw;
             if (!parsed || typeof parsed !== 'object') throw new Error('Invalid backup');
             if (!window.confirm('Replace current settings, history, and per-card overrides with this backup?')) return;
             settings = sanitizeSettings(parsed.settings);
