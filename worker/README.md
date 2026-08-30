@@ -26,14 +26,30 @@ npx wrangler secret put SYNC_TOKEN   # paste the token when prompted
 npx wrangler deploy
 ```
 
-No namespace to create and nothing to paste into `wrangler.toml`. `wrangler deploy` prints
-the worker URL, e.g. `https://javstore-sync.<subdomain>.workers.dev`.
+No namespace to create and nothing to paste into `wrangler.toml`.
+
+`workers_dev = false` is set, so the worker has **no `*.workers.dev` URL**: those subdomains
+are guessable, and the history behind this one is worth not advertising. Give it a route on a
+domain you own instead — uncomment `routes` in `wrangler.toml` and point it at a hostname in
+a zone on the same Cloudflare account:
+
+```toml
+routes = [
+    { pattern = "sync.example.com", custom_domain = true },
+]
+```
+
+Deploying with `workers_dev = false` and no route leaves the worker unreachable. If you would
+rather use the free subdomain, comment `workers_dev` out and `wrangler deploy` prints the URL,
+e.g. `https://javstore-sync.<subdomain>.workers.dev`.
 
 ## Point the userscript at it
 
 Open the `JVS` panel on JavStore → **Cloud sync**:
 
-- **Worker endpoint** — the URL from `wrangler deploy` (any path works; `/state` reads well).
+- **Worker endpoint** — your route, or the URL from `wrangler deploy` (any path works;
+  `/state` reads well). Changing the endpoint later is safe: the device notices it is a
+  different worker and re-uploads its history in full.
 - **Access token** — the token you generated.
 - Tick **Sync to my Cloudflare Worker**, then **Save sync settings**.
 
