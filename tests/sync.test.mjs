@@ -1,6 +1,6 @@
 import test, { afterEach } from 'node:test';
 import assert from 'node:assert/strict';
-import worker, { mergeDocuments } from '../worker/src/worker.mjs';
+import worker from '../worker/src/worker.mjs';
 import {
     makeStore, makeRemote, enableSync, openTab, closeTabs, settle, waitFor,
     listingHtml, card, clickCard, pressOnCard, visitedUrls,
@@ -227,18 +227,94 @@ test('an http endpoint that is not loopback is refused', async () => {
     assert.equal(store.data.get('javstore_sync_config_v1'), undefined);
 });
 
-test('a sync with nothing new does not write to the namespace', async () => {
+test('a sync with nothing new sends and receives nothing', async () => {
     const remote = makeRemote();
     const tab = await openDevice(remote);
     clickCard(tab.window, '/a.html');
     await settle();
     await syncNow(tab);
 
-    const writes = remote.kv.writes;
+    const rowsBefore = remote.rows().length;
     await syncNow(tab);
+    assert.deepEqual(remote.lastPushedChanges(), [], 'nothing to push');
+    assert.equal(remote.rows().length, rowsBefore, 'nothing new stored');
+    // The whole point of the delta protocol: an idle sync is a few hundred bytes.
+    assert.ok(JSON.stringify(remote.requests.at(-1).body).length < 1000);
+
     await syncNow(tab);
-    assert.equal(remote.kv.writes, writes, 'a sync that changes nothing should not store anything');
     assert.deepEqual(remote.visited(), ['https://javstore.net/a.html']);
+});
+
+test('pointing the panel at a different worker starts over', async () => {
+    const first = makeRemote({ origin: 'https://one.test' });
+    const second = makeRemote({ origin: 'https://two.test' });
+    second.token = first.token;
+    second.env.SYNC_TOKEN = first.token;
+
+    const store = makeStore();
+    enableSync(store, first);
+    const tab = await openTab(store, { html: listing(), remote: [first, second] });
+    await settle();
+    clickCard(tab.window, '/a.html');
+    await settle();
+    await syncNow(tab);
+    assert.ok(JSON.parse(store.data.get('javstore_sync_config_v1')).cursor > 0);
+
+    const form = tab.shadow().querySelector('form.sync-form');
+    form.elements.syncEndpoint.value = second.endpoint;
+    form.dispatchEvent(new tab.window.Event('submit', { bubbles: true, cancelable: true }));
+    await settle();
+
+    // The cursor from the old worker means nothing here, so the history goes up in full.
+    assert.deepEqual(second.visited(), ['https://javstore.net/a.html']);
+});
+
+test('only what changed since the last push goes up', async () => {
+    const remote = makeRemote();
+    const tab = await openDevice(remote);
+    clickCard(tab.window, '/a.html');
+    clickCard(tab.window, '/b.html');
+    await settle();
+    await syncNow(tab);
+    assert.equal(remote.lastPushedChanges().length, 2);
+
+    clickCard(tab.window, '/c.html');
+    await settle();
+    await syncNow(tab);
+    const pushed = remote.lastPushedChanges();
+    assert.equal(pushed.length, 1, 'the two already-synced visits are not sent again');
+    assert.equal(pushed[0].key, 'https://javstore.net/c.html');
+});
+
+test('a device pulls only what it has not seen', async () => {
+    const remote = makeRemote();
+    const first = await openDevice(remote);
+    clickCard(first.window, '/a.html');
+    await settle();
+    await syncNow(first);
+
+    const secondStore = makeStore();
+    const second = await openDevice(remote, { store: secondStore });
+    assert.deepEqual(visitedUrls(secondStore), ['https://javstore.net/a.html']);
+
+    clickCard(first.window, '/b.html');
+    await settle();
+    await syncNow(first);
+
+    await syncNow(second);
+    const pulled = JSON.parse(
+        (await remote.handle({
+            method: 'POST',
+            url: remote.endpoint,
+            headers: { Authorization: `Bearer ${remote.token}`, 'Content-Type': 'application/json' },
+            body: JSON.stringify({ cursor: 0, meta: {}, changes: [] }),
+        })).text,
+    );
+    assert.equal(pulled.changes.length, 2, 'a cursor of zero still gets the whole history');
+    assert.deepEqual(visitedUrls(secondStore).sort(), [
+        'https://javstore.net/a.html',
+        'https://javstore.net/b.html',
+    ]);
 });
 
 test('the stored token is not left anywhere the site can read it', async () => {
@@ -262,6 +338,28 @@ test('the stored token is not left anywhere the site can read it', async () => {
     assert.equal(JSON.parse(store.data.get('javstore_sync_config_v1')).token, 'panel-secret');
 });
 
+test('a backup taken from the worker imports back into the panel', async () => {
+    const remote = makeRemote();
+    const source = await openDevice(remote);
+    clickCard(source.window, '/a.html');
+    await settle();
+    await syncNow(source);
+
+    const response = await worker.fetch(new Request(remote.endpoint, {
+        headers: { Authorization: `Bearer ${remote.token}` },
+    }), remote.env);
+    const backup = await response.text();
+
+    const store = makeStore();
+    const tab = await openTab(store, { html: listing() });
+    const input = tab.shadow().querySelector('.import-file');
+    Object.defineProperty(input, 'files', { value: [{ text: async () => backup }] });
+    input.dispatchEvent(new tab.window.Event('change', { bubbles: true }));
+    await settle();
+
+    assert.deepEqual(visitedUrls(store), ['https://javstore.net/a.html']);
+});
+
 test('the worker refuses a request without the right token', async () => {
     const remote = makeRemote({ token: 'right' });
     const body = JSON.stringify({ state: { visited: { 'https://javstore.net/a.html': Date.now() } } });
@@ -273,7 +371,7 @@ test('the worker refuses a request without the right token', async () => {
         );
         assert.equal(response.status, 401);
     }
-    assert.equal(remote.state(), null);
+    assert.deepEqual(remote.rows(), [], 'nothing was stored');
 
     const allowed = await worker.fetch(
         new Request(remote.endpoint, { method: 'POST', headers: { Authorization: 'Bearer right' }, body }),
@@ -284,30 +382,85 @@ test('the worker refuses a request without the right token', async () => {
 });
 
 test('the worker keeps the newest timestamp and honours tombstones', async () => {
-    const merged = mergeDocuments(
-        {
-            updatedAt: 100,
-            visited: { '/a': 100, '/b': 500 },
-            tombstones: {},
-        },
-        {
-            updatedAt: 200,
-            visited: { '/a': 400, '/b': 200, '/c': 300 },
-            tombstones: { 'v|/c': 300 },
-        },
-        1000,
-    );
+    const remote = makeRemote();
+    const sync = payload => remote.store.sync(payload, 1000);
 
-    assert.deepEqual(merged.visited, { '/a': 400, '/b': 500 });
-    assert.equal(merged.tombstones['v|/c'], 300);
+    sync({ cursor: 0, changes: [{ kind: 'v', key: '/a', at: 100 }, { kind: 'v', key: '/b', at: 500 }] });
+    sync({
+        cursor: 0,
+        changes: [
+            { kind: 'v', key: '/a', at: 400 },
+            { kind: 'v', key: '/b', at: 200 },
+            { kind: 'v', key: '/c', at: 300 },
+            { kind: 'v', key: '/c', at: 300, deleted: 1 },
+        ],
+    });
+
+    const document = remote.state();
+    assert.deepEqual(document.visited, { '/a': 400, '/b': 500 });
+    assert.equal(document.tombstones['v|/c'], 300);
 });
 
-test('the worker answers a plain GET with the stored document', async () => {
+test('a device that is behind is told the winning entry it missed', async () => {
+    const remote = makeRemote();
+    remote.store.sync({ cursor: 0, changes: [{ kind: 'v', key: '/a', at: 500 }] });
+
+    // A stale device pushes an older timestamp for the same URL.
+    const answer = remote.store.sync({ cursor: 99, changes: [{ kind: 'v', key: '/a', at: 100 }] });
+    assert.deepEqual(answer.changes, [{ kind: 'v', key: '/a', at: 500, deleted: 0 }]);
+    assert.equal(remote.state().visited['/a'], 500);
+});
+
+test('a worker still running the document-only version keeps working', async () => {
+    const remote = makeRemote();
+    const legacy = {
+        async handle({ url, headers, body }) {
+            remote.requests.push({ url, headers, body: JSON.parse(body) });
+            // The 6.2.0 worker answered every POST with the whole document.
+            const parsed = JSON.parse(body);
+            if (parsed.state) {
+                // The 6.2.0 worker merged rather than replaced.
+                legacy.document = {
+                    ...legacy.document,
+                    ...parsed.state,
+                    visited: { ...legacy.document.visited, ...parsed.state.visited },
+                };
+            }
+            return { status: 200, statusText: '', text: JSON.stringify({ state: legacy.document }) };
+        },
+        document: {
+            version: 3,
+            updatedAt: Date.now(),
+            visited: { 'https://javstore.net/c.html': Date.now() },
+        },
+        endpoint: remote.endpoint,
+        token: remote.token,
+        offline: false,
+        requests: remote.requests,
+    };
+
+    const store = makeStore();
+    enableSync(store, legacy);
+    const tab = await openTab(store, { html: listing(), remote: legacy });
+    await settle();
+    clickCard(tab.window, '/a.html');
+    await settle();
+    tab.shadow().querySelector('.sync-now').click();
+    await settle();
+
+    assert.ok(card(tab.window, '/c.html').classList.contains('jvs-visited'), 'pulled from the old worker');
+    assert.ok(
+        Object.keys(legacy.document.visited).includes('https://javstore.net/a.html'),
+        'and still pushed to it',
+    );
+});
+
+test('the worker answers a plain GET with the whole document', async () => {
     const remote = makeRemote();
     await worker.fetch(new Request(remote.endpoint, {
         method: 'POST',
         headers: { Authorization: `Bearer ${remote.token}` },
-        body: JSON.stringify({ state: { updatedAt: 10, visited: { '/a': 10 } } }),
+        body: JSON.stringify({ cursor: 0, changes: [{ kind: 'v', key: '/a', at: 10 }] }),
     }), remote.env);
 
     const response = await worker.fetch(new Request(remote.endpoint, {
@@ -315,4 +468,23 @@ test('the worker answers a plain GET with the stored document', async () => {
     }), remote.env);
     assert.equal(response.status, 200);
     assert.deepEqual((await response.json()).state.visited, { '/a': 10 });
+});
+
+test('a history left behind in the KV namespace is imported once', async () => {
+    const at = Date.now();
+    const remote = makeRemote({
+        legacyDocument: {
+            version: 3,
+            updatedAt: at,
+            settingsUpdatedAt: at,
+            settings: { mode: 'blur' },
+            visited: { 'https://javstore.net/a.html': at },
+        },
+    });
+
+    const store = makeStore();
+    const tab = await openDevice(remote, { store });
+    assert.deepEqual(visitedUrls(store), ['https://javstore.net/a.html']);
+    assert.ok(card(tab.window, '/a.html').classList.contains('jvs-visited'));
+    assert.equal(tab.shadow().querySelector('form.settings-form').elements.mode.value, 'blur');
 });

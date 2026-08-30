@@ -1,155 +1,345 @@
 // Cloud sync backend for the JavStore Full Layout Cleanup userscript.
 //
-// One document per deployment, held in a Cloudflare KV namespace. A device POSTs the whole
-// document it holds; the worker merges it into the stored one and answers with the result,
-// so a device that has been offline for a week can never overwrite what the others recorded
-// in the meantime. The merge rules are the userscript's own: newest timestamp wins per URL,
-// a tombstone outranks an entry of the same age or older, and `resetAt`/`prunedBefore` are
-// horizons below which nothing survives.
+// One Durable Object holds the history in its SQLite storage. A Durable Object is
+// single-threaded, so the read-merge-write that a sync performs is serialized and strongly
+// consistent: two devices syncing in the same second queue behind one another instead of
+// both merging into the same stale base. That is the guarantee the earlier KV-backed
+// version could not give, and it is the one that matters when the copy a lost write drops
+// exists only on a device you are about to lose.
 //
-// KV is eventually consistent, so two devices syncing in the same second can read the same
-// version and one write can land on top of the other. That is recoverable rather than
-// destructive here: every device pushes its complete document on every sync, so whatever a
-// lost write dropped comes back on the next one.
+// Devices exchange deltas rather than the whole document. Each row carries a server-assigned
+// sequence number, so a device asks for "everything after seq N" and pushes only what it has
+// touched since its last successful push. An ordinary page load costs a few hundred bytes.
+//
+// Every entry is last-writer-wins on its own event timestamp, with a deletion winning a tie
+// — the same rule the userscript applies locally, so both sides converge on the same state.
 
 const STORAGE_VERSION = 3;
-const DOCUMENT_KEY = 'state';
-const MAX_VISITED_ITEMS = 5000;
-const MAX_TOMBSTONES = 2000;
-const TOMBSTONE_TTL_MS = 90 * 86400000;
+const OBJECT_NAME = 'default';
 const MAX_BODY_BYTES = 8 * 1024 * 1024;
-
-export function emptyDocument() {
-    return {
-        version: STORAGE_VERSION,
-        updatedAt: 0,
-        settingsUpdatedAt: 0,
-        resetAt: 0,
-        prunedBefore: 0,
-        settings: null,
-        visited: {},
-        overrides: {},
-        overrideTimes: {},
-        tombstones: {},
-    };
-}
+const MAX_PAGE_ROWS = 2000;
+// The server is the archive, so it holds far more than the 5,000 entries a device keeps.
+const MAX_ARCHIVED_VISITS = 50000;
+const TOMBSTONE_TTL_MS = 90 * 86400000;
+const MAX_KEY_LENGTH = 2000;
 
 function timestamp(value) {
     const time = Number(value);
-    return Number.isFinite(time) && time > 0 ? time : 0;
+    return Number.isFinite(time) && time > 0 ? Math.floor(time) : 0;
 }
 
-function timestampMap(value) {
-    const result = new Map();
-    if (!value || typeof value !== 'object' || Array.isArray(value)) return result;
-    for (const [key, raw] of Object.entries(value)) {
-        const time = timestamp(raw);
-        if (key && time) result.set(String(key).slice(0, 2000), time);
-    }
-    return result;
+function overrideValue(value) {
+    return value === 'allow' || value === 'block' ? value : null;
 }
 
-function overrideMap(value) {
-    const result = new Map();
-    if (!value || typeof value !== 'object' || Array.isArray(value)) return result;
-    for (const [key, raw] of Object.entries(value)) {
-        if (raw === 'allow' || raw === 'block') result.set(String(key).slice(0, 2000), raw);
+export class SyncStore {
+    constructor(ctx, env) {
+        this.ctx = ctx;
+        this.env = env;
+        this.sql = ctx.storage.sql;
+        this.imported = false;
+        this.#migrate();
     }
-    return result;
-}
 
-function sortedObject(entries) {
-    return Object.fromEntries([...entries].sort((a, b) => (a[0] < b[0] ? -1 : 1)));
-}
-
-// Applied identically in the userscript, so both sides of a sync keep the same entries
-// instead of handing each other back the ones the other just dropped.
-function capOldestFirst(map, limit) {
-    if (map.size <= limit) return;
-    [...map.entries()]
-        .sort((a, b) => (a[1] - b[1]) || (a[0] < b[0] ? -1 : 1))
-        .slice(0, map.size - limit)
-        .forEach(([key]) => map.delete(key));
-}
-
-function settingsAge(document) {
-    return Object.prototype.hasOwnProperty.call(document, 'settingsUpdatedAt')
-        ? timestamp(document.settingsUpdatedAt)
-        : timestamp(document.updatedAt);
-}
-
-export function mergeDocuments(base, incoming, now = Date.now()) {
-    const left = base && typeof base === 'object' ? base : emptyDocument();
-    const right = incoming && typeof incoming === 'object' ? incoming : emptyDocument();
-
-    const resetAt = Math.max(timestamp(left.resetAt), timestamp(right.resetAt));
-    const prunedBefore = Math.max(timestamp(left.prunedBefore), timestamp(right.prunedBefore));
-
-    const tombstones = timestampMap(left.tombstones);
-    for (const [key, at] of timestampMap(right.tombstones)) {
-        if (at > (tombstones.get(key) || 0)) tombstones.set(key, at);
+    #migrate() {
+        this.sql.exec(`CREATE TABLE IF NOT EXISTS entries (
+            kind    TEXT    NOT NULL,
+            key     TEXT    NOT NULL,
+            at      INTEGER NOT NULL,
+            deleted INTEGER NOT NULL DEFAULT 0,
+            value   TEXT,
+            seq     INTEGER NOT NULL,
+            PRIMARY KEY (kind, key)
+        )`);
+        this.sql.exec('CREATE INDEX IF NOT EXISTS entries_by_seq ON entries (seq)');
+        this.sql.exec('CREATE INDEX IF NOT EXISTS entries_by_at ON entries (kind, deleted, at)');
+        this.sql.exec('CREATE TABLE IF NOT EXISTS meta (name TEXT PRIMARY KEY, value TEXT NOT NULL)');
     }
-    for (const [key, at] of tombstones) {
-        if (now - at > TOMBSTONE_TTL_MS) tombstones.delete(key);
-    }
-    capOldestFirst(tombstones, MAX_TOMBSTONES);
 
-    const visited = timestampMap(left.visited);
-    for (const [url, at] of timestampMap(right.visited)) {
-        if (at > (visited.get(url) || 0)) visited.set(url, at);
-    }
-    for (const [url, at] of visited) {
-        const buried = tombstones.get(`v|${url}`) || 0;
-        if (at <= resetAt || at <= prunedBefore || at <= buried) visited.delete(url);
-    }
-    capOldestFirst(visited, MAX_VISITED_ITEMS);
-
-    const overrides = overrideMap(left.overrides);
-    const overrideTimes = timestampMap(left.overrideTimes);
-    const rightOverrides = overrideMap(right.overrides);
-    const rightOverrideTimes = timestampMap(right.overrideTimes);
-    for (const [url, value] of rightOverrides) {
-        const at = rightOverrideTimes.get(url) || 0;
-        if (overrides.has(url) && at < (overrideTimes.get(url) || 0)) continue;
-        overrides.set(url, value);
-        overrideTimes.set(url, at);
-    }
-    for (const [url, at] of overrideTimes) {
-        if (at < (tombstones.get(`o|${url}`) || 0)) {
-            overrides.delete(url);
-            overrideTimes.delete(url);
+    #meta(name, fallback = null) {
+        const rows = this.sql.exec('SELECT value FROM meta WHERE name = ?', name).toArray();
+        if (!rows.length) return fallback;
+        try {
+            return JSON.parse(rows[0].value);
+        } catch (error) {
+            return fallback;
         }
     }
-    for (const url of [...overrideTimes.keys()]) {
-        if (!overrides.has(url)) overrideTimes.delete(url);
+
+    #setMeta(name, value) {
+        this.sql.exec(
+            'INSERT INTO meta (name, value) VALUES (?, ?) ON CONFLICT(name) DO UPDATE SET value = excluded.value',
+            name,
+            JSON.stringify(value),
+        );
     }
 
-    // Settings travel with their own timestamp: a device that never touched them carries a
-    // zero and so can never push its defaults over another device's choices. Only a document
-    // predating the field falls back to its `updatedAt`.
-    const leftSettingsAt = settingsAge(left);
-    const rightSettingsAt = settingsAge(right);
-    const rightWins = right.settings && typeof right.settings === 'object'
-        && (rightSettingsAt > leftSettingsAt || !left.settings || typeof left.settings !== 'object');
+    #nextSeq() {
+        const next = timestamp(this.#meta('seq', 0)) + 1;
+        this.#setMeta('seq', next);
+        return next;
+    }
 
-    return {
-        version: STORAGE_VERSION,
-        updatedAt: Math.max(timestamp(left.updatedAt), timestamp(right.updatedAt), now),
-        settingsUpdatedAt: rightWins ? rightSettingsAt : leftSettingsAt,
-        resetAt,
-        prunedBefore,
-        settings: rightWins ? right.settings : (left.settings ?? null),
-        visited: sortedObject(visited),
-        overrides: sortedObject(overrides),
-        overrideTimes: sortedObject(overrideTimes),
-        tombstones: sortedObject(tombstones),
-    };
-}
+    #horizons() {
+        return {
+            resetAt: timestamp(this.#meta('resetAt', 0)),
+            prunedBefore: timestamp(this.#meta('prunedBefore', 0)),
+        };
+    }
 
-// `updatedAt` moves on every merge by design, so it is not part of what makes two versions
-// of the document the same.
-function sameDocument(left, right) {
-    return JSON.stringify({ ...left, updatedAt: 0 }) === JSON.stringify({ ...right, updatedAt: 0 });
+    #readMeta() {
+        return {
+            resetAt: timestamp(this.#meta('resetAt', 0)),
+            prunedBefore: timestamp(this.#meta('prunedBefore', 0)),
+            settings: this.#meta('settings', null),
+            settingsUpdatedAt: timestamp(this.#meta('settingsUpdatedAt', 0)),
+        };
+    }
+
+    // The horizons only ever move forward, and dropping what falls below them is what stops
+    // a device that has been offline from resurrecting a cleared history.
+    #applyMeta(meta) {
+        if (!meta || typeof meta !== 'object') return;
+        const current = this.#readMeta();
+
+        const resetAt = timestamp(meta.resetAt);
+        if (resetAt > current.resetAt) {
+            this.#setMeta('resetAt', resetAt);
+            this.sql.exec('DELETE FROM entries WHERE kind = ? AND deleted = 0 AND at <= ?', 'v', resetAt);
+        }
+
+        const prunedBefore = timestamp(meta.prunedBefore);
+        if (prunedBefore > current.prunedBefore) {
+            this.#setMeta('prunedBefore', prunedBefore);
+            this.sql.exec('DELETE FROM entries WHERE kind = ? AND deleted = 0 AND at <= ?', 'v', prunedBefore);
+        }
+
+        // Settings carry their own timestamp, so a device that has never changed one sends a
+        // zero and can never push its defaults over another device's choices.
+        const settingsUpdatedAt = timestamp(meta.settingsUpdatedAt);
+        if (meta.settings && typeof meta.settings === 'object'
+            && (settingsUpdatedAt > current.settingsUpdatedAt || !current.settings)) {
+            this.#setMeta('settings', meta.settings);
+            this.#setMeta('settingsUpdatedAt', settingsUpdatedAt);
+        }
+    }
+
+    #existing(kind, key) {
+        const rows = this.sql
+            .exec('SELECT kind, key, at, deleted, value, seq FROM entries WHERE kind = ? AND key = ?', kind, key)
+            .toArray();
+        return rows.length ? rows[0] : null;
+    }
+
+    // Returns the row the device should be told about instead: null when it is already in
+    // step, or the winning row when what it sent has been beaten by something newer.
+    #applyChange(change) {
+        if (!change || typeof change !== 'object') return null;
+        const kind = change.kind === 'o' ? 'o' : 'v';
+        const key = String(change.key || '').slice(0, MAX_KEY_LENGTH);
+        const at = timestamp(change.at);
+        const deleted = change.deleted ? 1 : 0;
+        const value = kind === 'o' && !deleted ? overrideValue(change.value) : null;
+        if (!key || !at) return null;
+        if (kind === 'o' && !deleted && !value) return null;
+
+        const { resetAt, prunedBefore } = this.#horizons();
+        if (kind === 'v' && !deleted && (at <= resetAt || at <= prunedBefore)) return null;
+
+        const existing = this.#existing(kind, key);
+        if (existing) {
+            const wins = at > existing.at || (at === existing.at && deleted && !existing.deleted);
+            if (!wins) {
+                const agreed = existing.at === at
+                    && Boolean(existing.deleted) === Boolean(deleted)
+                    && (existing.value || null) === value;
+                return agreed ? null : existing;
+            }
+        }
+
+        this.sql.exec(
+            `INSERT INTO entries (kind, key, at, deleted, value, seq) VALUES (?, ?, ?, ?, ?, ?)
+             ON CONFLICT(kind, key) DO UPDATE SET
+                at = excluded.at, deleted = excluded.deleted, value = excluded.value, seq = excluded.seq`,
+            kind, key, at, deleted, value, this.#nextSeq(),
+        );
+        return null;
+    }
+
+    #prune(now) {
+        // Tombstones only need to outlive the stale snapshots they protect against.
+        this.sql.exec('DELETE FROM entries WHERE deleted = 1 AND at < ?', now - TOMBSTONE_TTL_MS);
+
+        const counted = this.sql
+            .exec('SELECT COUNT(*) AS total FROM entries WHERE kind = ? AND deleted = 0', 'v')
+            .toArray();
+        const total = Number(counted[0]?.total || 0);
+        if (total <= MAX_ARCHIVED_VISITS) return;
+        // Dropped outright rather than tombstoned: a device that still holds one of these
+        // will not push it back, because it is older than that device's last push.
+        this.sql.exec(
+            `DELETE FROM entries WHERE rowid IN (
+                SELECT rowid FROM entries WHERE kind = ? AND deleted = 0
+                ORDER BY at ASC, key ASC LIMIT ?
+            )`,
+            'v',
+            total - MAX_ARCHIVED_VISITS,
+        );
+    }
+
+    // One sync: hand the device everything recorded since the sequence number it last saw,
+    // take what it has touched since its last push, and report the new sequence number.
+    sync(payload, now = Date.now()) {
+        const cursor = timestamp(payload.cursor);
+        const limit = Math.min(MAX_PAGE_ROWS, Math.max(1, Number(payload.limit) || MAX_PAGE_ROWS));
+
+        // Read before writing: the rows this request is about to store are ones the device
+        // already has, so echoing them straight back would waste the round trip.
+        const ahead = this.sql
+            .exec(
+                'SELECT kind, key, at, deleted, value, seq FROM entries WHERE seq > ? ORDER BY seq LIMIT ?',
+                cursor,
+                limit + 1,
+            )
+            .toArray();
+        const more = ahead.length > limit;
+        const changes = more ? ahead.slice(0, limit) : ahead;
+
+        this.#applyMeta(payload.meta);
+
+        const incoming = Array.isArray(payload.changes) ? payload.changes : [];
+        const seen = new Set(changes.map(row => `${row.kind}|${row.key}`));
+        for (const change of incoming) {
+            const correction = this.#applyChange(change);
+            if (!correction) continue;
+            const id = `${correction.kind}|${correction.key}`;
+            if (seen.has(id)) continue;
+            seen.add(id);
+            changes.push(correction);
+        }
+
+        if (incoming.length) this.#prune(now);
+
+        return {
+            cursor: more ? changes[limit - 1].seq : timestamp(this.#meta('seq', 0)),
+            more,
+            meta: this.#readMeta(),
+            changes: changes.map(row => ({
+                kind: row.kind,
+                key: row.key,
+                at: row.at,
+                deleted: row.deleted ? 1 : 0,
+                ...(row.value ? { value: row.value } : {}),
+            })),
+        };
+    }
+
+    // The 6.2.0 shape, kept so a device that has not been updated still syncs, and so a
+    // plain GET can hand you the whole history for a backup.
+    document() {
+        const meta = this.#readMeta();
+        const visited = {};
+        const overrides = {};
+        const overrideTimes = {};
+        const tombstones = {};
+        for (const row of this.sql.exec('SELECT kind, key, at, deleted, value FROM entries ORDER BY key')) {
+            if (row.deleted) {
+                tombstones[`${row.kind}|${row.key}`] = row.at;
+            } else if (row.kind === 'v') {
+                visited[row.key] = row.at;
+            } else if (row.value) {
+                overrides[row.key] = row.value;
+                overrideTimes[row.key] = row.at;
+            }
+        }
+        return {
+            version: STORAGE_VERSION,
+            updatedAt: Date.now(),
+            settingsUpdatedAt: meta.settingsUpdatedAt,
+            resetAt: meta.resetAt,
+            prunedBefore: meta.prunedBefore,
+            settings: meta.settings,
+            visited,
+            overrides,
+            overrideTimes,
+            tombstones,
+        };
+    }
+
+    applyDocument(state, now = Date.now()) {
+        this.#applyMeta({
+            resetAt: state.resetAt,
+            prunedBefore: state.prunedBefore,
+            settings: state.settings,
+            settingsUpdatedAt: Object.prototype.hasOwnProperty.call(state, 'settingsUpdatedAt')
+                ? state.settingsUpdatedAt
+                : state.updatedAt,
+        });
+
+        const changes = [];
+        const entries = value => (value && typeof value === 'object' && !Array.isArray(value)
+            ? Object.entries(value)
+            : []);
+        for (const [key, at] of entries(state.tombstones)) {
+            const kind = key.startsWith('o|') ? 'o' : 'v';
+            changes.push({ kind, key: key.slice(2), at, deleted: 1 });
+        }
+        for (const [key, at] of entries(state.visited)) {
+            changes.push({ kind: 'v', key, at });
+        }
+        const overrideTimes = new Map(entries(state.overrideTimes));
+        for (const [key, value] of entries(state.overrides)) {
+            changes.push({ kind: 'o', key, at: overrideTimes.get(key) || 0, value });
+        }
+        changes.forEach(change => this.#applyChange(change));
+        if (changes.length) this.#prune(now);
+    }
+
+    // A namespace left over from the KV-backed version is imported once, so upgrading the
+    // worker does not start anyone from an empty history.
+    async #importLegacyStore() {
+        if (this.imported) return;
+        this.imported = true;
+        if (this.#meta('kvImported', false) || !this.env?.JAVSTORE_SYNC) return;
+        this.#setMeta('kvImported', true);
+        try {
+            const stored = await this.env.JAVSTORE_SYNC.get('state', 'json');
+            if (stored && typeof stored === 'object') this.applyDocument(stored);
+        } catch (error) {
+            console.warn('Legacy KV document could not be imported.', error);
+        }
+    }
+
+    async fetch(request) {
+        await this.#importLegacyStore();
+
+        if (request.method === 'GET') {
+            return Response.json({ state: this.document() });
+        }
+        if (request.method !== 'POST') {
+            return Response.json({ error: 'Use GET to read or POST to sync.' }, { status: 405 });
+        }
+
+        let body;
+        try {
+            const text = await request.text();
+            if (text.length > MAX_BODY_BYTES) {
+                return Response.json({ error: 'The request is too large to sync.' }, { status: 413 });
+            }
+            body = JSON.parse(text);
+        } catch (error) {
+            return Response.json({ error: 'The request body is not JSON.' }, { status: 400 });
+        }
+        if (!body || typeof body !== 'object') {
+            return Response.json({ error: 'The request carried nothing to sync.' }, { status: 400 });
+        }
+
+        if (body.state && typeof body.state === 'object') {
+            this.applyDocument(body.state);
+            return Response.json({ state: this.document() });
+        }
+        return Response.json(this.sync(body));
+    }
 }
 
 function corsHeaders(env) {
@@ -162,8 +352,8 @@ function corsHeaders(env) {
     };
 }
 
-function json(body, status, env) {
-    return new Response(JSON.stringify(body), {
+function fail(message, status, env) {
+    return new Response(JSON.stringify({ error: message }), {
         status,
         headers: {
             'Content-Type': 'application/json; charset=utf-8',
@@ -176,7 +366,7 @@ function json(body, status, env) {
 // Compares in constant time for equal-length strings; only the token's length can leak.
 function tokenMatches(presented, expected) {
     if (typeof presented !== 'string' || typeof expected !== 'string') return false;
-    if (presented.length !== expected.length || !expected) return false;
+    if (!expected || presented.length !== expected.length) return false;
     let mismatch = 0;
     for (let index = 0; index < presented.length; index += 1) {
         mismatch |= presented.charCodeAt(index) ^ expected.charCodeAt(index);
@@ -196,50 +386,20 @@ export default {
             return new Response(null, { status: 204, headers: corsHeaders(env) });
         }
         if (!env?.SYNC_TOKEN) {
-            return json({ error: 'The worker has no SYNC_TOKEN secret configured.' }, 500, env);
+            return fail('The worker has no SYNC_TOKEN secret configured.', 500, env);
         }
         if (!tokenMatches(presentedToken(request), env.SYNC_TOKEN)) {
-            return json({ error: 'Unauthorized.' }, 401, env);
+            return fail('Unauthorized.', 401, env);
         }
-        if (!env?.JAVSTORE_SYNC) {
-            return json({ error: 'The worker has no JAVSTORE_SYNC KV binding.' }, 500, env);
-        }
-
-        const stored = (await env.JAVSTORE_SYNC.get(DOCUMENT_KEY, 'json')) || emptyDocument();
-
-        if (request.method === 'GET') {
-            return json({ state: stored }, 200, env);
-        }
-        if (request.method !== 'POST') {
-            return json({ error: 'Use GET to read or POST to sync.' }, 405, env);
+        if (!env?.SYNC_STORE) {
+            return fail('The worker has no SYNC_STORE Durable Object binding.', 500, env);
         }
 
-        let body;
-        try {
-            const text = await request.text();
-            if (text.length > MAX_BODY_BYTES) {
-                return json({ error: 'The document is too large to sync.' }, 413, env);
-            }
-            body = JSON.parse(text);
-        } catch (error) {
-            return json({ error: 'The request body is not JSON.' }, 400, env);
-        }
-
-        const incoming = body && typeof body === 'object'
-            ? (body.state && typeof body.state === 'object' ? body.state : body)
-            : null;
-        if (!incoming) {
-            return json({ error: 'The request carried no state.' }, 400, env);
-        }
-
-        const merged = mergeDocuments(stored, incoming);
-        // Most syncs are a device confirming it already agrees with the worker—a page load
-        // with nothing new to report. Writing those back would burn the KV write allowance
-        // and churn `updatedAt` for every other device, so only a real change is stored.
-        if (sameDocument(stored, merged)) {
-            return json({ state: stored }, 200, env);
-        }
-        await env.JAVSTORE_SYNC.put(DOCUMENT_KEY, JSON.stringify(merged));
-        return json({ state: merged }, 200, env);
+        const store = env.SYNC_STORE.get(env.SYNC_STORE.idFromName(OBJECT_NAME));
+        const answer = await store.fetch(request);
+        const headers = new Headers(answer.headers);
+        headers.set('Cache-Control', 'no-store');
+        for (const [name, value] of Object.entries(corsHeaders(env))) headers.set(name, value);
+        return new Response(answer.body, { status: answer.status, headers });
     },
 };

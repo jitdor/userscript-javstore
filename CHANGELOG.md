@@ -1,5 +1,15 @@
 # Changelog
 
+## 6.3.0
+
+- Change: cloud sync now stores history in a Durable Object with SQLite storage instead of a KV namespace. A Durable Object is single-threaded and strongly consistent, so the read-merge-write each sync performs is serialized—two devices syncing in the same second queue behind one another rather than both merging into the same stale base, which is the window in which KV could drop one device's entries.
+- Change: devices exchange only what changed. Each remembers the sequence number it last saw and the moment it last pushed, so an idle page load costs about 150 bytes each way instead of the whole document—roughly 450 KB once a history reaches the 5,000-entry cap.
+- Add: an entry pushed by a device that is behind is answered with the winning entry, so it cannot stay wrong about it.
+- Add: a history left behind in the 6.2.0 KV namespace is imported once, when the namespace is still bound.
+- Add: a backup taken straight from the worker (`GET /state`) can be fed to "Import backup" as-is.
+- Compatible in both directions during an upgrade: the worker still answers the 6.2.0 whole-document protocol, and a 6.3.0 device falls back to it when it finds an older worker, so devices and worker can be updated in either order.
+- Note: the worker keeps up to 50,000 visited entries as an archive; a device still keeps its newest 5,000.
+
 ## 6.2.0
 
 - Add: optional cloud sync. Settings, visited history, and per-card overrides can be mirrored to a Cloudflare Worker you deploy yourself (`worker/`), so history survives a userscript-manager reinstall and follows you between devices. Configure the endpoint and token under "Cloud sync" in the settings panel; sync is off until you do.
