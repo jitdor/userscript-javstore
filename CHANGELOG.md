@@ -1,5 +1,10 @@
 # Changelog
 
+## 6.3.1
+
+- Fix: a sync no longer gives up when the userscript manager refuses the cross-origin request. AdGuard can decline a `GM_xmlhttpRequest` that Tampermonkey allows—its `@connect` handling is not the same—and the fallback to `fetch` only ran when the API was missing altogether, never when it failed. A refusal is now retried through `fetch`, which the worker's CORS headers permit.
+- Fix: the failure shown in the panel carries what the engine actually reported—a status when the worker answered one, the refusal text when the request never left the browser—rather than always reading "the worker could not be reached".
+
 ## 6.3.0
 
 - Change: cloud sync now stores history in a Durable Object with SQLite storage instead of a KV namespace. A Durable Object is single-threaded and strongly consistent, so the read-merge-write each sync performs is serialized—two devices syncing in the same second queue behind one another rather than both merging into the same stale base, which is the window in which KV could drop one device's entries.
