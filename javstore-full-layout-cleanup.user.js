@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         JavStore Full Layout Cleanup - No Sidebars + Mosaic Overlay
 // @namespace    http://tampermonkey.net/
-// @version      6.3.0
+// @version      6.3.1
 // @description  Clean up JavStore's layout, filter keyword-matched thumbnails, and track visited items with private, configurable controls.
 // @homepageURL  https://github.com/jitdor/userscript-javstore
 // @supportURL   https://github.com/jitdor/userscript-javstore/issues
@@ -21,7 +21,7 @@
 (function () {
     'use strict';
 
-    const SCRIPT_VERSION = '6.3.0';
+    const SCRIPT_VERSION = '6.3.1';
     const STORAGE_VERSION = 3;
     const STORAGE_KEY = 'javstore_cleanup_state_v2';
     const LEGACY_STORAGE_KEY = 'javstore_seen_links';
@@ -617,9 +617,74 @@
         }
     }
 
-    // GM_xmlhttpRequest is what reaches the worker from a page on another origin. Engines
-    // that do not expose it fall back to fetch, which works because the worker answers with
-    // CORS headers; the token travels in a header either way, never in the URL.
+    // GM_xmlhttpRequest is what reaches the worker from a page on another origin, and fetch
+    // is the fallback: engines differ in how they handle `@connect`, and AdGuard in
+    // particular can decline a cross-origin GM call outright, so a refusal there is retried
+    // through fetch—which the worker's CORS headers allow. The token travels in a header
+    // either way, never in the URL.
+    function remoteFailure(message, { retryable = false } = {}) {
+        const failure = new Error(message);
+        failure.retryable = retryable;
+        return failure;
+    }
+
+    // A refusal arrives with no status at all: the request never left the browser. Anything
+    // carrying a status came from the worker and is reported as such.
+    function describeTransportError(response) {
+        const status = Number(response?.status) || 0;
+        if (status) return `the worker answered ${status}`;
+        const detail = String(response?.error || response?.statusText || '').trim();
+        return detail
+            ? `the worker could not be reached (${detail})`
+            : 'the worker could not be reached';
+    }
+
+    function fetchRemote(url, headers, body) {
+        if (typeof window.fetch !== 'function') {
+            return Promise.reject(remoteFailure('this browser cannot reach the worker'));
+        }
+        return window.fetch(url, { method: 'POST', headers, body, credentials: 'omit', cache: 'no-store' })
+            .then(
+                async response => {
+                    if (!response.ok) throw remoteFailure(`the worker answered ${response.status}`);
+                    try {
+                        return await response.json();
+                    } catch (error) {
+                        throw remoteFailure('the worker did not return JSON');
+                    }
+                },
+                error => {
+                    throw remoteFailure(`the worker could not be reached (${error?.message || 'blocked'})`);
+                },
+            );
+    }
+
+    function gmRemote(send, url, headers, body) {
+        return new Promise((resolve, reject) => {
+            send({
+                method: 'POST',
+                url,
+                headers,
+                data: body,
+                timeout: REMOTE_TIMEOUT_MS,
+                onload: response => {
+                    const status = Number(response?.status) || 0;
+                    if (status < 200 || status >= 300) {
+                        reject(remoteFailure(`the worker answered ${status || 'nothing'}`));
+                        return;
+                    }
+                    try {
+                        resolve(JSON.parse(response.responseText));
+                    } catch (error) {
+                        reject(remoteFailure('the worker did not return JSON'));
+                    }
+                },
+                onerror: response => reject(remoteFailure(describeTransportError(response), { retryable: true })),
+                ontimeout: () => reject(remoteFailure('the worker timed out')),
+            });
+        });
+    }
+
     function requestRemote(payload) {
         const url = syncConfig.endpoint;
         const headers = {
@@ -633,35 +698,13 @@
                 ? GM.xmlHttpRequest.bind(GM)
                 : null);
 
-        if (!send) {
-            return window.fetch(url, { method: 'POST', headers, body, credentials: 'omit', cache: 'no-store' })
-                .then(async response => {
-                    if (!response.ok) throw new Error(`the worker answered ${response.status}`);
-                    return response.json();
-                });
-        }
-
-        return new Promise((resolve, reject) => {
-            send({
-                method: 'POST',
-                url,
-                headers,
-                data: body,
-                timeout: REMOTE_TIMEOUT_MS,
-                onload: response => {
-                    const status = Number(response?.status) || 0;
-                    if (status < 200 || status >= 300) {
-                        reject(new Error(`the worker answered ${status || 'nothing'}`));
-                        return;
-                    }
-                    try {
-                        resolve(JSON.parse(response.responseText));
-                    } catch (error) {
-                        reject(new Error('the worker did not return JSON'));
-                    }
-                },
-                onerror: () => reject(new Error('the worker could not be reached')),
-                ontimeout: () => reject(new Error('the worker timed out')),
+        if (!send) return fetchRemote(url, headers, body);
+        return gmRemote(send, url, headers, body).catch(error => {
+            if (!error?.retryable) throw error;
+            // Report the original refusal if fetch cannot get through either: that is the
+            // path the userscript manager was supposed to take.
+            return fetchRemote(url, headers, body).catch(() => {
+                throw error;
             });
         });
     }

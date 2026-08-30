@@ -159,8 +159,15 @@ export async function openTab(store, {
         // A tab may be able to reach more than one worker (the panel can be repointed at a
         // different endpoint), so requests are routed by the URL they were sent to.
         const remotes = Array.isArray(remote) ? remote : [remote];
+        const route = url => remotes.find(candidate => url.startsWith(candidate.endpoint)) || remotes[0];
         window.GM_xmlhttpRequest = ({ method, url, headers, data, onload, onerror }) => {
-            const target = remotes.find(candidate => url.startsWith(candidate.endpoint)) || remotes[0];
+            const target = route(url);
+            // `blockGm` stands in for a userscript manager that declines the cross-origin
+            // call, which is how AdGuard can behave: no status, the request never leaves.
+            if (target.blockGm) {
+                onerror({ error: 'Forbidden' });
+                return;
+            }
             target.handle({ method, url, headers, body: data })
                 .then(response => onload({
                     status: response.status,
@@ -168,6 +175,16 @@ export async function openTab(store, {
                     responseText: response.text,
                 }))
                 .catch(error => onerror({ error: String(error) }));
+        };
+        // jsdom has no fetch of its own, so the fallback path gets one that reaches the
+        // same workers.
+        window.fetch = async (url, { method = 'GET', headers, body } = {}) => {
+            const response = await route(url).handle({ method, url, headers, body });
+            return {
+                ok: response.status >= 200 && response.status < 300,
+                status: response.status,
+                json: async () => JSON.parse(response.text),
+            };
         };
     }
 

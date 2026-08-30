@@ -360,6 +360,30 @@ test('a backup taken from the worker imports back into the panel', async () => {
     assert.deepEqual(visitedUrls(store), ['https://javstore.net/a.html']);
 });
 
+test('a userscript manager that refuses the request falls back to fetch', async () => {
+    const remote = makeRemote();
+    remote.blockGm = true;
+
+    const store = makeStore();
+    const tab = await openDevice(remote, { store });
+    clickCard(tab.window, '/a.html');
+    await settle();
+    await syncNow(tab);
+
+    assert.deepEqual(remote.visited(), ['https://javstore.net/a.html']);
+    assert.match(tab.shadow().querySelector('.counts').textContent, /synced/);
+});
+
+test('a worker that cannot be reached either way reports the refusal', async () => {
+    const remote = makeRemote();
+    remote.blockGm = true;
+    remote.offline = true;
+
+    const tab = await openDevice(remote);
+    await syncNow(tab);
+    assert.match(tab.shadow().querySelector('.counts').textContent, /could not be reached \(Forbidden\)/);
+});
+
 test('the worker refuses a request without the right token', async () => {
     const remote = makeRemote({ token: 'right' });
     const body = JSON.stringify({ state: { visited: { 'https://javstore.net/a.html': Date.now() } } });
