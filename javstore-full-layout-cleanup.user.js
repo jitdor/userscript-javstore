@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         JavStore Full Layout Cleanup - No Sidebars + Mosaic Overlay
 // @namespace    http://tampermonkey.net/
-// @version      6.1.0
+// @version      6.2.0
 // @description  Clean up JavStore's layout, filter keyword-matched thumbnails, and track visited items with private, configurable controls.
 // @homepageURL  https://github.com/jitdor/userscript-javstore
 // @supportURL   https://github.com/jitdor/userscript-javstore/issues
@@ -14,21 +14,30 @@
 // @grant        GM_setValue
 // @grant        GM_addValueChangeListener
 // @grant        GM_registerMenuCommand
+// @grant        GM_xmlhttpRequest
+// @connect      *
 // ==/UserScript==
 
 (function () {
     'use strict';
 
-    const SCRIPT_VERSION = '6.1.0';
+    const SCRIPT_VERSION = '6.2.0';
     const STORAGE_VERSION = 3;
     const STORAGE_KEY = 'javstore_cleanup_state_v2';
     const LEGACY_STORAGE_KEY = 'javstore_seen_links';
     const PENDING_VISITS_KEY = 'javstore_pending_visits';
+    // The sync endpoint and its token are deliberately kept outside the synchronized
+    // document: they are per-device credentials, so they neither travel to the worker nor
+    // end up in an exported backup.
+    const SYNC_CONFIG_KEY = 'javstore_sync_config_v1';
     const MAX_VISITED_ITEMS = 5000;
     const MAX_PENDING_VISITS = 50;
     const MAX_TOMBSTONES = 2000;
     const TOMBSTONE_TTL_MS = 90 * 86400000;
     const SYNC_POLL_MS = 45000;
+    const REMOTE_PUSH_DEBOUNCE_MS = 4000;
+    const REMOTE_REFRESH_MIN_GAP_MS = 60000;
+    const REMOTE_TIMEOUT_MS = 20000;
     const NON_ITEM_PATH = /^\/(?:page|search|tag|tags|category|categories|login|logout|register|profile|user|feed|rss)(?:\/|$)/i;
     const CARD_SELECTOR = 'main .grid a[href]';
 
@@ -53,6 +62,13 @@
         filter: 'all',
     });
 
+    const DEFAULT_SYNC_CONFIG = Object.freeze({
+        enabled: false,
+        endpoint: '',
+        token: '',
+        intervalMinutes: 5,
+    });
+
     const VALID_MODES = new Set(['tint', 'blur', 'hide']);
     const VALID_FILTERS = new Set(['all', 'unvisited', 'visited', 'matched']);
     const VALID_STRATEGIES = new Set(['word', 'substring', 'regex']);
@@ -63,10 +79,21 @@
     let overrideTimes = new Map();
     let tombstones = new Map();
     let resetAt = 0;
+    let prunedBefore = 0;
+    let settingsUpdatedAt = 0;
     let lastKnownUpdatedAt = 0;
     let lastSavedAt = 0;
     let lastSaveFailed = false;
     let writeQueue = Promise.resolve(false);
+    let syncConfig = { ...DEFAULT_SYNC_CONFIG };
+    let remoteQueue = Promise.resolve(false);
+    let remotePushTimer = 0;
+    let remotePollTimer = 0;
+    let lastRemoteAttemptAt = 0;
+    let lastRemoteSyncAt = 0;
+    let lastRemoteError = '';
+    let remoteSyncRunning = false;
+    let applyingRemoteState = false;
     let syncTimer = 0;
     let storageAvailable = true;
     let observer = null;
@@ -193,7 +220,9 @@
             version: STORAGE_VERSION,
             scriptVersion: SCRIPT_VERSION,
             updatedAt: Date.now(),
+            settingsUpdatedAt,
             resetAt,
+            prunedBefore,
             settings: { ...settings },
             visited: Object.fromEntries(visited),
             overrides: Object.fromEntries(overrides),
@@ -235,13 +264,34 @@
         const remoteOverrideTimes = parseTimestamps(stored.overrideTimes);
         const remoteTombstones = parseTimestamps(stored.tombstones);
         const remoteReset = parseTimestamp(stored.resetAt);
+        const remotePruned = parseTimestamp(stored.prunedBefore);
         const remoteUpdatedAt = parseTimestamp(stored.updatedAt);
+        // A document written before this field existed carries its settings' age in
+        // `updatedAt`; one that carries the field with a zero has never had its settings
+        // touched, and must not be read as "as new as the document" or an untouched device
+        // would push its defaults over everyone else's choices.
+        const remoteSettingsAt = Object.prototype.hasOwnProperty.call(stored, 'settingsUpdatedAt')
+            ? parseTimestamp(stored.settingsUpdatedAt)
+            : remoteUpdatedAt;
         let changed = false;
 
         if (remoteReset > resetAt) {
             resetAt = remoteReset;
             for (const [url, at] of visited) {
                 if (at <= resetAt) {
+                    visited.delete(url);
+                    changed = true;
+                }
+            }
+        }
+
+        // Retention pruning drops entries without leaving a tombstone for each one, so the
+        // cutoff itself travels with the document; without it every other device would hand
+        // the expired entries straight back on the next merge.
+        if (remotePruned > prunedBefore) {
+            prunedBefore = remotePruned;
+            for (const [url, at] of visited) {
+                if (at <= prunedBefore) {
                     visited.delete(url);
                     changed = true;
                 }
@@ -267,7 +317,7 @@
         }
 
         for (const [url, at] of remoteVisited) {
-            if (at <= resetAt || at <= tombstoneTime('v', url)) continue;
+            if (at <= resetAt || at <= prunedBefore || at <= tombstoneTime('v', url)) continue;
             if (at <= (visited.get(url) || 0)) continue;
             visited.set(url, at);
             changed = true;
@@ -283,12 +333,16 @@
             changed = true;
         }
 
-        if (adoptSettings && remoteUpdatedAt > lastKnownUpdatedAt) {
+        // Only a document that actually carries settings may replace the local ones: an
+        // empty remote store must not reset this device to the defaults.
+        if (adoptSettings && stored.settings && typeof stored.settings === 'object'
+            && remoteSettingsAt > settingsUpdatedAt) {
             const remoteSettings = sanitizeSettings(stored.settings);
             if (JSON.stringify(remoteSettings) !== JSON.stringify(settings)) {
                 settings = remoteSettings;
                 changed = true;
             }
+            settingsUpdatedAt = remoteSettingsAt;
         }
 
         lastKnownUpdatedAt = Math.max(lastKnownUpdatedAt, remoteUpdatedAt);
@@ -299,6 +353,7 @@
     // other's changes on engines where GM_setValue resolves asynchronously.
     function persistState() {
         writeQueue = writeQueue.then(() => writeStoredState(), () => writeStoredState());
+        scheduleRemotePush();
         return writeQueue;
     }
 
@@ -393,7 +448,7 @@
         if (!settings.trackVisited) return false;
         let changed = false;
         entries.forEach(({ url, at }) => {
-            if (at <= resetAt || at <= tombstoneTime('v', url)) return;
+            if (at <= resetAt || at <= prunedBefore || at <= tombstoneTime('v', url)) return;
             if (at <= (visited.get(url) || 0)) return;
             visited.set(url, at);
             changed = true;
@@ -459,11 +514,15 @@
             for (const [url, timestamp] of visited) {
                 if (timestamp < cutoff) visited.delete(url);
             }
+            if (cutoff > prunedBefore) prunedBefore = cutoff;
         }
 
+        // The cap is applied the same way here and in the worker—oldest first, URL breaking
+        // a timestamp tie—so both sides of a sync keep the same 5,000 entries instead of
+        // handing each other back the ones the other just dropped.
         if (visited.size > MAX_VISITED_ITEMS) {
             [...visited.entries()]
-                .sort((a, b) => a[1] - b[1])
+                .sort((a, b) => (a[1] - b[1]) || (a[0] < b[0] ? -1 : 1))
                 .slice(0, visited.size - MAX_VISITED_ITEMS)
                 .forEach(([url]) => visited.delete(url));
         }
@@ -481,6 +540,197 @@
         for (const url of overrideTimes.keys()) {
             if (!overrides.has(url)) overrideTimes.delete(url);
         }
+    }
+
+    // ------------------------------------------------------------------
+    // Cloud sync
+    //
+    // The userscript manager's own storage is the working copy, but it is the thing that
+    // keeps disappearing: AdGuard drops it on some upgrades, and it never leaves the
+    // device. So the same document is also mirrored to a Cloudflare Worker that the user
+    // owns. Every sync is a single request that hands the worker this device's whole
+    // document and gets the merged result back, using the same rules as the local merge
+    // (newest timestamp per URL wins, tombstones and `resetAt`/`prunedBefore` outrank a
+    // stale entry). Because each device pushes its full state on every sync, a write the
+    // worker's storage happens to lose is restored by the next sync rather than lost.
+    // ------------------------------------------------------------------
+
+    // Visited history is the payload, so it has to be encrypted in transit. Plain http is
+    // accepted only against a loopback worker, which is what `wrangler dev` serves.
+    function isSyncEndpoint(value) {
+        try {
+            const url = new URL(value);
+            if (url.protocol === 'https:') return true;
+            return url.protocol === 'http:'
+                && (url.hostname === 'localhost' || url.hostname === '127.0.0.1' || url.hostname === '[::1]');
+        } catch (error) {
+            return false;
+        }
+    }
+
+    function sanitizeSyncConfig(value = {}) {
+        const candidate = value && typeof value === 'object' ? value : {};
+        const endpoint = String(candidate.endpoint || '').trim().slice(0, 500);
+        return {
+            enabled: candidate.enabled === true,
+            endpoint: isSyncEndpoint(endpoint) ? endpoint : '',
+            token: String(candidate.token || '').trim().slice(0, 500),
+            intervalMinutes: clamp(candidate.intervalMinutes, 1, 1440, DEFAULT_SYNC_CONFIG.intervalMinutes),
+        };
+    }
+
+    function syncConfigured() {
+        return syncConfig.enabled && Boolean(syncConfig.endpoint);
+    }
+
+    async function readSyncConfig() {
+        try {
+            return sanitizeSyncConfig(await Promise.resolve(GM_getValue(SYNC_CONFIG_KEY, null)));
+        } catch (error) {
+            console.warn('[JVS] Cloud sync configuration could not be read.', error);
+            return { ...DEFAULT_SYNC_CONFIG };
+        }
+    }
+
+    async function writeSyncConfig(next) {
+        syncConfig = sanitizeSyncConfig(next);
+        try {
+            await Promise.resolve(GM_setValue(SYNC_CONFIG_KEY, { ...syncConfig }));
+            return true;
+        } catch (error) {
+            console.warn('[JVS] Cloud sync configuration could not be saved.', error);
+            return false;
+        }
+    }
+
+    // GM_xmlhttpRequest is what reaches the worker from a page on another origin. Engines
+    // that do not expose it fall back to fetch, which works because the worker answers with
+    // CORS headers; the token travels in a header either way, never in the URL.
+    function requestRemote(payload) {
+        const url = syncConfig.endpoint;
+        const headers = {
+            'Content-Type': 'application/json',
+            Authorization: `Bearer ${syncConfig.token}`,
+        };
+        const body = JSON.stringify(payload);
+        const send = typeof GM_xmlhttpRequest === 'function'
+            ? GM_xmlhttpRequest
+            : (typeof GM === 'object' && GM && typeof GM.xmlHttpRequest === 'function'
+                ? GM.xmlHttpRequest.bind(GM)
+                : null);
+
+        if (!send) {
+            return window.fetch(url, { method: 'POST', headers, body, credentials: 'omit', cache: 'no-store' })
+                .then(async response => {
+                    if (!response.ok) throw new Error(`the worker answered ${response.status}`);
+                    return response.json();
+                });
+        }
+
+        return new Promise((resolve, reject) => {
+            send({
+                method: 'POST',
+                url,
+                headers,
+                data: body,
+                timeout: REMOTE_TIMEOUT_MS,
+                onload: response => {
+                    const status = Number(response?.status) || 0;
+                    if (status < 200 || status >= 300) {
+                        reject(new Error(`the worker answered ${status || 'nothing'}`));
+                        return;
+                    }
+                    try {
+                        resolve(JSON.parse(response.responseText));
+                    } catch (error) {
+                        reject(new Error('the worker did not return JSON'));
+                    }
+                },
+                onerror: () => reject(new Error('the worker could not be reached')),
+                ontimeout: () => reject(new Error('the worker timed out')),
+            });
+        });
+    }
+
+    // Syncs are queued for the same reason writes are: two overlapping merge cycles would
+    // each build on a snapshot the other has already moved past.
+    function queueSync(options = {}) {
+        if (!syncConfigured()) return Promise.resolve(false);
+        remoteQueue = remoteQueue.then(() => runSync(options), () => runSync(options));
+        return remoteQueue;
+    }
+
+    async function runSync({ manual = false } = {}) {
+        if (!syncConfigured()) return false;
+        lastRemoteAttemptAt = Date.now();
+        remoteSyncRunning = true;
+        scheduleCountUpdate();
+        try {
+            // Let any local write finish first so the document being pushed is the current one.
+            await writeQueue.catch(() => false);
+            pruneVisited();
+            const answer = await requestRemote({ client: SCRIPT_VERSION, state: serializeState() });
+            const remoteState = answer && typeof answer === 'object'
+                ? (answer.state && typeof answer.state === 'object' ? answer.state : answer)
+                : null;
+            if (!remoteState || typeof remoteState !== 'object') {
+                throw new Error('the worker returned no state');
+            }
+
+            // The flag stays up across the write that follows: what the merge produced is
+            // exactly what the worker already holds, so pushing it straight back would only
+            // make every pull cost a second request.
+            applyingRemoteState = true;
+            const changed = applyStoredState(remoteState);
+            lastRemoteSyncAt = Date.now();
+            lastRemoteError = '';
+            if (changed) await persistState();
+            if (manual) showToast(changed ? 'Synced. Remote history merged in.' : 'Synced. Nothing new.');
+            return changed;
+        } catch (error) {
+            lastRemoteError = String(error?.message || 'sync failed');
+            console.warn('[JVS] Cloud sync failed.', error);
+            if (manual) showToast(`Sync failed: ${lastRemoteError}`, true);
+            return false;
+        } finally {
+            applyingRemoteState = false;
+            remoteSyncRunning = false;
+            scheduleCountUpdate();
+        }
+    }
+
+    function scheduleRemotePush() {
+        if (!syncConfigured() || applyingRemoteState) return;
+        window.clearTimeout(remotePushTimer);
+        remotePushTimer = window.setTimeout(() => queueSync(), REMOTE_PUSH_DEBOUNCE_MS);
+    }
+
+    // Coming back to a tab is the moment its history is most likely to be stale, but it is
+    // also easy to trigger dozens of times a minute, so it only syncs when the last attempt
+    // is old enough.
+    function syncOnFocus() {
+        if (!syncConfigured()) return;
+        if (Date.now() - lastRemoteAttemptAt < REMOTE_REFRESH_MIN_GAP_MS) return;
+        queueSync();
+    }
+
+    function restartSyncTimer() {
+        window.clearInterval(remotePollTimer);
+        remotePollTimer = 0;
+        if (!syncConfigured()) return;
+        remotePollTimer = window.setInterval(() => queueSync(), syncConfig.intervalMinutes * 60000);
+    }
+
+    function describeSyncState() {
+        if (!syncConfig.enabled) return 'cloud sync off';
+        if (!syncConfig.endpoint) return 'cloud sync needs an endpoint';
+        if (remoteSyncRunning) return 'syncing…';
+        if (lastRemoteError) return `sync failed: ${lastRemoteError}`;
+        if (!lastRemoteSyncAt) return 'not synced yet';
+        const minutes = Math.floor((Date.now() - lastRemoteSyncAt) / 60000);
+        if (minutes < 1) return 'synced just now';
+        if (minutes < 60) return `synced ${minutes} min ago`;
+        return `synced at ${new Date(lastRemoteSyncAt).toLocaleTimeString()}`;
     }
 
     settings = sanitizeSettings();
@@ -957,7 +1207,7 @@
         const counts = getCounts();
         const capped = counts.stored >= MAX_VISITED_ITEMS ? ' (cap reached—oldest are dropped)' : '';
         ui.summary.textContent = `${counts.matched} matched · ${counts.visited} visited`;
-        ui.counts.textContent = `${counts.total} cards on this page · ${counts.stored} visited URLs stored${capped} · ${describeSaveState()}`;
+        ui.counts.textContent = `${counts.total} cards on this page · ${counts.stored} visited URLs stored${capped} · ${describeSaveState()} · ${describeSyncState()}`;
     }
 
     function showToast(message, isError = false) {
@@ -1021,8 +1271,36 @@
         elements.filter.value = settings.filter;
     }
 
+    function readSyncForm() {
+        const elements = ui.syncForm.elements;
+        const typed = String(elements.syncToken.value || '').trim();
+        return sanitizeSyncConfig({
+            enabled: elements.syncEnabled.checked,
+            endpoint: elements.syncEndpoint.value,
+            // An empty box means "keep the token already stored"—it is deliberately never
+            // filled back in, so it cannot be read as a request to clear it.
+            token: typed || syncConfig.token,
+            intervalMinutes: elements.syncIntervalMinutes.value,
+        });
+    }
+
+    function fillSyncForm() {
+        if (!ui) return;
+        const elements = ui.syncForm.elements;
+        elements.syncEnabled.checked = syncConfig.enabled;
+        elements.syncEndpoint.value = syncConfig.endpoint;
+        // The panel lives in an open shadow root, which the site's own scripts can reach, so
+        // the token is never parked in the DOM: the box only reports whether one is stored.
+        elements.syncToken.value = '';
+        elements.syncToken.placeholder = syncConfig.token
+            ? 'Stored — type to replace'
+            : 'Paste the token from your worker';
+        elements.syncIntervalMinutes.value = syncConfig.intervalMinutes;
+    }
+
     function applySettings(nextSettings, message = 'Settings applied.') {
         settings = sanitizeSettings(nextSettings);
+        settingsUpdatedAt = Date.now();
         pruneVisited();
         setRootState();
         processAllCards();
@@ -1074,6 +1352,7 @@
             if (!parsed || typeof parsed !== 'object') throw new Error('Invalid backup');
             if (!window.confirm('Replace current settings, history, and per-card overrides with this backup?')) return;
             settings = sanitizeSettings(parsed.settings);
+            settingsUpdatedAt = Date.now();
             resetAt = Date.now();
             visited = parseVisited(parsed.visited);
             overrides = parseOverrides(parsed.overrides);
@@ -1181,7 +1460,7 @@
                 </div>
                 <p class="warning storage-warning" hidden>Private storage is unavailable. Changes will work for this page but cannot be saved.</p>
                 <p class="counts muted"></p>
-                <form>
+                <form class="settings-form">
                     <h3>Filtering</h3>
                     <div class="grid">
                         <label>Mode
@@ -1221,6 +1500,18 @@
                     <button class="card-override" type="button">Override: default</button>
                 </div>
                 <p class="muted">Keyboard: focus a card and press R to reveal, V to mark visited, or O to cycle its override. On touch, long-press a matched card. Press the global shortcut outside form fields to reveal/protect all.</p>
+                <h3>Cloud sync</h3>
+                <p class="muted">Mirror settings and visited history to a Cloudflare Worker you own, so history survives a userscript-manager reinstall and follows you between devices. The <code>worker/</code> folder in the repository has the deploy steps. The endpoint and token stay on this device: they are never written into the synced document or an exported backup.</p>
+                <form class="sync-form">
+                    <div class="grid">
+                        <label class="check full"><input name="syncEnabled" type="checkbox"> Sync to my Cloudflare Worker</label>
+                        <label class="full">Worker endpoint <input name="syncEndpoint" type="url" spellcheck="false" autocomplete="off" placeholder="https://javstore-sync.example.workers.dev/state"></label>
+                        <label class="full">Access token <input name="syncToken" type="password" spellcheck="false" autocomplete="off"></label>
+                        <p class="muted full">The token is stored by the userscript manager, not kept in the page. Leave the box empty to keep the token already saved.</p>
+                        <label>Sync every (minutes) <input name="syncIntervalMinutes" type="number" min="1" max="1440" step="1"></label>
+                    </div>
+                    <div class="actions"><button class="primary save-sync" type="submit">Save sync settings</button><button class="sync-now" type="button">Sync now</button></div>
+                </form>
                 <h3>Data</h3>
                 <div class="actions">
                     <button class="export" type="button">Export backup</button>
@@ -1235,10 +1526,11 @@
         const panel = shadow.querySelector('.panel');
         const summary = shadow.querySelector('.summary');
         const liftButton = shadow.querySelector('.lift');
-        const form = shadow.querySelector('form');
+        const form = shadow.querySelector('form.settings-form');
+        const syncForm = shadow.querySelector('form.sync-form');
         const selectedActions = [...shadow.querySelectorAll('.selected-actions button')];
         ui = {
-            host, shadow, panel, summary, liftButton, form, selectedActions,
+            host, shadow, panel, summary, liftButton, form, syncForm, selectedActions,
             counts: shadow.querySelector('.counts'),
             storageWarning: shadow.querySelector('.storage-warning'),
             selectedTitle: shadow.querySelector('.selected-title'),
@@ -1252,6 +1544,7 @@
             summary.setAttribute('aria-expanded', String(open));
             if (open) {
                 fillSettingsForm();
+                fillSyncForm();
                 updateUi();
                 shadow.querySelector('.close').focus();
             }
@@ -1292,11 +1585,40 @@
             processAllCards();
             showToast('Visited history cleared.');
         });
+        syncForm.addEventListener('submit', async event => {
+            event.preventDefault();
+            const next = readSyncForm();
+            if (next.enabled && !next.endpoint) {
+                showToast('Sync needs an https worker URL.', true);
+                return;
+            }
+            if (next.enabled && !next.token) {
+                showToast('Sync needs the access token from your worker.', true);
+                return;
+            }
+            const saved = await writeSyncConfig(next);
+            fillSyncForm();
+            restartSyncTimer();
+            if (!saved) {
+                showToast('Sync settings could not be saved.', true);
+                return;
+            }
+            showToast(syncConfigured() ? 'Sync settings saved. Syncing…' : 'Sync settings saved.');
+            if (syncConfigured()) queueSync({ manual: true });
+        });
+        shadow.querySelector('.sync-now').addEventListener('click', () => {
+            if (!syncConfigured()) {
+                showToast('Turn on cloud sync and save an endpoint first.', true);
+                return;
+            }
+            queueSync({ manual: true });
+        });
         shadow.addEventListener('keydown', event => {
             if (event.key === 'Escape') setPanelOpen(false);
         });
 
         fillSettingsForm();
+        fillSyncForm();
         updateUi();
         ui.open = () => setPanelOpen(true);
     }
@@ -1353,8 +1675,14 @@
             processAllCards();
             refreshFromStorage();
         });
-        window.addEventListener('focus', refreshFromStorage);
-        document.addEventListener('visibilitychange', refreshFromStorage);
+        window.addEventListener('focus', () => {
+            refreshFromStorage();
+            syncOnFocus();
+        });
+        document.addEventListener('visibilitychange', () => {
+            refreshFromStorage();
+            if (document.visibilityState === 'visible') syncOnFocus();
+        });
 
         let liveSync = false;
         try {
@@ -1370,6 +1698,13 @@
             window.addEventListener('pagehide', () => window.clearInterval(syncTimer));
         }
 
+        restartSyncTimer();
+        window.addEventListener('pagehide', () => {
+            window.clearInterval(remotePollTimer);
+            window.clearTimeout(remotePushTimer);
+        });
+        queueSync();
+
         try {
             GM_registerMenuCommand('Open JavStore Cleanup settings', () => ui?.open());
             GM_registerMenuCommand('Reveal/protect all matched cards', toggleOverlays);
@@ -1379,6 +1714,7 @@
     }
 
     async function boot() {
+        syncConfig = await readSyncConfig();
         const initialState = await readStoredState();
         settings = sanitizeSettings(initialState?.settings);
         visited = parseVisited(initialState?.visited);
@@ -1386,7 +1722,9 @@
         overrideTimes = parseTimestamps(initialState?.overrideTimes);
         tombstones = parseTimestamps(initialState?.tombstones);
         resetAt = parseTimestamp(initialState?.resetAt);
+        prunedBefore = parseTimestamp(initialState?.prunedBefore);
         lastKnownUpdatedAt = parseTimestamp(initialState?.updatedAt);
+        settingsUpdatedAt = parseTimestamp(initialState?.settingsUpdatedAt) || lastKnownUpdatedAt;
         const replayed = replayPendingVisits();
         pruneVisited();
         await migrateLegacyHistory();

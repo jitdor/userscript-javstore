@@ -20,10 +20,22 @@ A Tampermonkey userscript that cleans up JavStore's layout, protects keyword-mat
 - Synchronizes settings and history across tabs, merging rather than overwriting, and falls back to polling when the userscript manager cannot notify tabs of changes.
 - Replays clicks whose save was interrupted by the page unloading, and records a visit when a detail page is opened from JavStore.
 - Imports and exports settings, visited history, and per-card overrides as a JSON backup.
+- Optionally mirrors settings and history to a Cloudflare Worker you own, so history survives a userscript-manager reinstall and follows you between devices.
 
-All settings and visited history stay in the userscript manager's local storage. The script does not send that data to an external service.
+By default all settings and visited history stay in the userscript manager's local storage, and the script does not send that data anywhere. Turning on cloud sync sends it to the worker you configure, and nowhere else.
 
 With "Fast-navigation safety net" enabled (the default), a click is also written to `sessionStorage` until the userscript manager confirms it stored the visit. That note lives in the tab only, holds nothing beyond the URL currently being opened, is removed as soon as the real save lands, and can be switched off in the settings panel.
+
+## Cloud sync (optional)
+
+Userscript-manager storage is local to one device and AdGuard has been known to lose it across upgrades. Cloud sync keeps a copy of the same document in a Cloudflare Worker with a KV namespace that you deploy and own—[`worker/`](./worker) has the deploy steps and takes about five minutes.
+
+Once it is deployed, open the `JVS` panel → **Cloud sync**, enter the worker URL and the access token you generated, tick the box, and save. Repeat on every device with the same URL and token.
+
+- Each device syncs on page load, when its tab regains focus, a few seconds after a visit, on the interval you choose, and whenever you press **Sync now**. The panel's status line reports the last sync or the reason the last one failed.
+- Every sync is one request that hands the worker the device's whole document and gets the merged one back. The worker applies the same rules as the local merge—newest timestamp wins per URL, tombstones and the clear/retention horizons outrank stale entries—so a device that has been offline for a week cannot overwrite what the others recorded, and clearing history on one device clears it everywhere instead of being undone.
+- The endpoint and token live only on the device they were entered on. They are never written into the synced document, never appear in an exported backup, and are not left in the page: the token box stays empty once a token is stored and only reports that one exists.
+- A worker that is unreachable does not affect anything locally: history is still saved to the userscript manager, and the next sync picks it up.
 
 ## Controls
 
@@ -38,6 +50,7 @@ With "Fast-navigation safety net" enabled (the default), a click is also written
 - Target: `https://javstore.net/*`
 - Run timing: `document-start`
 - Required userscript APIs: `GM_addStyle`, `GM_getValue`, `GM_setValue`
+- Cloud sync additionally uses `GM_xmlhttpRequest` with `@connect *`, because the worker URL is yours to choose. It is only called once sync is switched on; engines without it fall back to `fetch`, which the worker's CORS headers allow.
 - Optional userscript APIs: `GM_addValueChangeListener` and `GM_registerMenuCommand`. AdGuard does not implement either; the script polls for changes instead of being notified, and its own on-page control replaces the manager menu.
 - `GM_getValue`/`GM_setValue` are supported in both the synchronous Tampermonkey style and the asynchronous GM4 style AdGuard uses.
 
@@ -49,4 +62,4 @@ The distributable is [`javstore-full-layout-cleanup.user.js`](./javstore-full-la
 
 Releases publish themselves: a push to `main` whose `@version` header names a version with no release yet runs the tests and publishes that release, which is what `@updateURL`/`@downloadURL` point at. A push that does not bump the header is a no-op, so releasing a change means bumping `@version` and `SCRIPT_VERSION` and adding the matching `## <version>` section to `CHANGELOG.md` in the same pull request. The workflow can still be run manually to release from a branch.
 
-`npm install && npm test` runs the storage-persistence suite. It loads the userscript into jsdom windows that share one asynchronous value store with no change notifications—an AdGuard-shaped engine—and asserts that history survives reloads, concurrent tabs, interrupted saves, and explicit removals.
+`npm install && npm test` runs the storage-persistence and cloud-sync suites. Both load the userscript into jsdom windows that share one asynchronous value store with no change notifications—an AdGuard-shaped engine—and assert that history survives reloads, concurrent tabs, interrupted saves, and explicit removals. The sync suite additionally runs the real worker from [`worker/src/worker.mjs`](./worker/src/worker.mjs) against a stand-in KV namespace, with each jsdom window acting as a separate device, so both halves of a sync are covered.
