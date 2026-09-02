@@ -1,5 +1,10 @@
 # Changelog
 
+## 6.3.2
+
+- Fix: a sync saves the history it pulled before recording the cursor that covers it. The cursor was written first, so a state write that was interrupted by a navigation—or refused by the userscript manager—left the device permanently past rows it had never stored: after a reload it asked only for changes after that cursor and those entries were never offered again.
+- Fix: a merge that brings back only protective metadata—a tombstone, a newer clear-history or retention cutoff, a newer settings timestamp—is saved too. Such a merge removes nothing that is on screen, so it was treated as "nothing changed" and left unsaved while the cursor moved past it: the tombstone was lost, and a sibling tab holding an older snapshot could merge the deleted visit back in.
+
 ## 6.3.1
 
 - Fix: a sync no longer gives up when the userscript manager refuses the cross-origin request. AdGuard can decline a `GM_xmlhttpRequest` that Tampermonkey allows—its `@connect` handling is not the same—and the fallback to `fetch` only ran when the API was missing altogether, never when it failed. A refusal is now retried through `fetch`, which the worker's CORS headers permit.
