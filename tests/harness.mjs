@@ -20,11 +20,16 @@ export function makeStore() {
     return {
         data,
         dropWrites: false,
+        // Storage that rejects the history document while still taking the small
+        // bookkeeping values: that is the shape of a quota refusal, and the case where a
+        // sync must not record a cursor for rows it could not save.
+        dropStateWrites: false,
         get(key, fallback) {
             return Promise.resolve(data.has(key) ? JSON.parse(data.get(key)) : fallback);
         },
         set(key, value) {
             if (this.dropWrites) return Promise.resolve();
+            if (this.dropStateWrites && key === 'javstore_cleanup_state_v2') return Promise.resolve();
             data.set(key, JSON.stringify(value));
             return Promise.resolve();
         },

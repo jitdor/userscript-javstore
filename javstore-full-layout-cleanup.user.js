@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         JavStore Full Layout Cleanup - No Sidebars + Mosaic Overlay
 // @namespace    http://tampermonkey.net/
-// @version      6.3.1
+// @version      6.3.2
 // @description  Clean up JavStore's layout, filter keyword-matched thumbnails, and track visited items with private, configurable controls.
 // @homepageURL  https://github.com/jitdor/userscript-javstore
 // @supportURL   https://github.com/jitdor/userscript-javstore/issues
@@ -21,7 +21,7 @@
 (function () {
     'use strict';
 
-    const SCRIPT_VERSION = '6.3.1';
+    const SCRIPT_VERSION = '6.3.2';
     const STORAGE_VERSION = 3;
     const STORAGE_KEY = 'javstore_cleanup_state_v2';
     const LEGACY_STORAGE_KEY = 'javstore_seen_links';
@@ -102,6 +102,12 @@
     let lastRemoteError = '';
     let remoteSyncRunning = false;
     let applyingRemoteState = false;
+    // A merge can absorb protective metadata—a tombstone, a newer `resetAt`, `prunedBefore`
+    // or `settingsUpdatedAt`—without removing anything that is on screen, so
+    // `mergeStoredState` reports "nothing visibly changed" while the document is now
+    // different. That still has to reach storage, so the last merge also records whether it
+    // adopted anything at all.
+    let lastMergeAdopted = false;
     let syncTimer = 0;
     let storageAvailable = true;
     let observer = null;
@@ -265,6 +271,7 @@
     // wins per URL, and removals are recorded as timestamps of their own (a per-URL
     // tombstone, or `resetAt` for a full clear) so that merging cannot resurrect them.
     function mergeStoredState(stored, { adoptSettings = false } = {}) {
+        lastMergeAdopted = false;
         if (!stored || typeof stored !== 'object') return false;
 
         const remoteVisited = parseVisited(stored.visited);
@@ -282,9 +289,11 @@
             ? parseTimestamp(stored.settingsUpdatedAt)
             : remoteUpdatedAt;
         let changed = false;
+        let adopted = false;
 
         if (remoteReset > resetAt) {
             resetAt = remoteReset;
+            adopted = true;
             for (const [url, at] of visited) {
                 if (at <= resetAt) {
                     visited.delete(url);
@@ -298,6 +307,7 @@
         // the expired entries straight back on the next merge.
         if (remotePruned > prunedBefore) {
             prunedBefore = remotePruned;
+            adopted = true;
             for (const [url, at] of visited) {
                 if (at <= prunedBefore) {
                     visited.delete(url);
@@ -309,6 +319,7 @@
         for (const [key, at] of remoteTombstones) {
             if (at <= (tombstones.get(key) || 0)) continue;
             tombstones.set(key, at);
+            adopted = true;
             const url = key.slice(2);
             if (key.startsWith('v|')) {
                 if (visited.has(url) && visited.get(url) <= at) {
@@ -351,9 +362,11 @@
                 changed = true;
             }
             settingsUpdatedAt = remoteSettingsAt;
+            adopted = true;
         }
 
         lastKnownUpdatedAt = Math.max(lastKnownUpdatedAt, remoteUpdatedAt);
+        lastMergeAdopted = adopted || changed;
         return changed;
     }
 
@@ -796,6 +809,7 @@
             const horizon = Date.now();
             let outgoing = localChangesSince(pushedAt);
             let changed = false;
+            let absorbed = false;
             let legacy = false;
 
             for (let page = 0; page < MAX_SYNC_PAGES; page += 1) {
@@ -818,6 +832,7 @@
                     const echoed = await requestRemote({ client: SCRIPT_VERSION, state: serializeState() });
                     const document = echoed?.state && typeof echoed.state === 'object' ? echoed.state : answer.state;
                     if (applyStoredState(document)) changed = true;
+                    if (lastMergeAdopted) absorbed = true;
                     break;
                 }
 
@@ -825,9 +840,25 @@
                 cursor = Math.max(0, Number(answer.cursor) || 0);
                 applyingRemoteState = true;
                 if (applyStoredState(documentFromRows(answer.changes, answer.meta))) changed = true;
+                // A batch can carry nothing but protective metadata—a tombstone, a newer
+                // `resetAt`, `prunedBefore` or `settingsUpdatedAt`—which removes nothing on
+                // screen and so leaves `changed` false. It still has to be saved: the cursor
+                // moves past it either way, and losing it lets a stale sibling tab merge an
+                // already-deleted visit back in.
+                if (lastMergeAdopted) absorbed = true;
                 applyingRemoteState = false;
                 if (!outgoing.length && !answer.more) break;
             }
+
+            // What was pulled has to be in storage before the cursor is allowed past it.
+            // The cursor is the durable record of what this device has already seen, so if
+            // it advanced first and the state write were then interrupted by a navigation or
+            // rejected outright, the next sync would ask only for rows after that cursor and
+            // the merged ones would never be offered again.
+            applyingRemoteState = true;
+            const saved = (changed || absorbed) ? await persistState() : true;
+            applyingRemoteState = false;
+            if (!saved) throw new Error('the merged history could not be saved');
 
             // Only recorded after the exchange succeeded: a failed sync has to send the same
             // entries again rather than assume the worker took them.
@@ -840,8 +871,6 @@
 
             lastRemoteSyncAt = Date.now();
             lastRemoteError = '';
-            applyingRemoteState = true;
-            if (changed) await persistState();
             if (manual) showToast(changed ? 'Synced. Remote history merged in.' : 'Synced. Nothing new.');
             return changed;
         } catch (error) {

@@ -245,6 +245,60 @@ test('a sync with nothing new sends and receives nothing', async () => {
     assert.deepEqual(remote.visited(), ['https://javstore.net/a.html']);
 });
 
+test('the cursor does not move past history that could not be saved', async () => {
+    const remote = makeRemote();
+    const first = await openDevice(remote);
+    clickCard(first.window, '/a.html');
+    await settle();
+    await syncNow(first);
+
+    // The pull succeeds but storage refuses the merged history, so the device is still
+    // missing /a.html once the tab is gone.
+    const secondStore = makeStore();
+    secondStore.dropStateWrites = true;
+    await openDevice(remote, { store: secondStore });
+    await waitFor(() => remote.requests.length > 0);
+    // Long enough for the write to be retried and given up on.
+    await settle(600);
+    assert.equal(secondStore.state(), null, 'precondition: the history never landed');
+    assert.ok(
+        !JSON.parse(secondStore.data.get('javstore_sync_config_v1')).cursor,
+        'a cursor recorded here would skip the rows that were lost',
+    );
+
+    // Reopening the device is the reload after the failed write: the rows have to come
+    // down again.
+    closeTabs();
+    secondStore.dropStateWrites = false;
+    await openDevice(remote, { store: secondStore });
+    await waitFor(() => visitedUrls(secondStore).length === 1);
+    assert.deepEqual(visitedUrls(secondStore), ['https://javstore.net/a.html']);
+});
+
+test('a merge that only brings back a tombstone is still saved', async () => {
+    const remote = makeRemote();
+    const first = await openDevice(remote);
+    clickCard(first.window, '/a.html');
+    await settle();
+    await syncNow(first);
+    pressOnCard(first.window, '/a.html', 'v');
+    await settle();
+    await syncNow(first);
+
+    // This device has never seen /a.html, so the visit and the deletion that follows it
+    // cancel out: nothing on screen changes, but the tombstone that keeps the visit from
+    // coming back has to survive the reload the cursor was recorded for.
+    const secondStore = makeStore();
+    await openDevice(remote, { store: secondStore });
+    await waitFor(() => secondStore.state());
+    assert.deepEqual(visitedUrls(secondStore), []);
+    assert.ok(
+        secondStore.state().tombstones['v|https://javstore.net/a.html'],
+        'the tombstone reached storage',
+    );
+    assert.ok(JSON.parse(secondStore.data.get('javstore_sync_config_v1')).cursor > 0);
+});
+
 test('pointing the panel at a different worker starts over', async () => {
     const first = makeRemote({ origin: 'https://one.test' });
     const second = makeRemote({ origin: 'https://two.test' });
