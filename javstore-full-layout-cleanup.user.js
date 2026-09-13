@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         JavStore Full Layout Cleanup - No Sidebars + Mosaic Overlay
 // @namespace    http://tampermonkey.net/
-// @version      6.3.2
+// @version      6.4.0
 // @description  Clean up JavStore's layout, filter keyword-matched thumbnails, and track visited items with private, configurable controls.
 // @homepageURL  https://github.com/jitdor/userscript-javstore
 // @supportURL   https://github.com/jitdor/userscript-javstore/issues
@@ -21,7 +21,7 @@
 (function () {
     'use strict';
 
-    const SCRIPT_VERSION = '6.3.2';
+    const SCRIPT_VERSION = '6.4.0';
     const STORAGE_VERSION = 3;
     const STORAGE_KEY = 'javstore_cleanup_state_v2';
     const LEGACY_STORAGE_KEY = 'javstore_seen_links';
@@ -42,6 +42,12 @@
     const MAX_SYNC_PAGES = 12;
     const NON_ITEM_PATH = /^\/(?:page|search|tag|tags|category|categories|login|logout|register|profile|user|feed|rss)(?:\/|$)/i;
     const CARD_SELECTOR = 'main .grid a[href]';
+    // A page that says it is an article says so about itself; a listing page does not.
+    const ITEM_PAGE_META = 'meta[property="og:type"][content="article"], meta[property="article:published_time"]';
+    // How much text outside the cards makes a page carrying cards an item page rather than
+    // a listing, in characters. A listing's own text is a heading and its pagination; an
+    // item page has a description and a file list above whatever related cards follow.
+    const MIN_ITEM_TEXT = 400;
 
     const DEFAULT_SETTINGS = Object.freeze({
         keywords: ['mosaic', 'mozaic', 'moza'],
@@ -477,20 +483,16 @@
         return changed;
     }
 
-    // Landing on a detail page is the visit the click-time write races against, so treat
-    // arriving there as evidence in its own right: no cards on the page plus a JavStore
-    // referrer means a card link brought the user here, whatever happened to that write.
+    // Landing on an item page is the visit itself, so it is recorded on its own evidence,
+    // whatever happened to the click that was supposed to record it. That matters beyond a
+    // lost write: "open link in new tab" from the browser's context menu reaches the page
+    // as no click at all—the menu belongs to the browser, and only `contextmenu` (button 2)
+    // is dispatched, which is equally what a "Copy link" or a dismissed menu looks like—so
+    // this is the only honest place to catch it. Ctrl/Cmd+click and middle-click do
+    // dispatch a click, which is why they alone used to be recorded.
     function recordCurrentPageVisit() {
         if (!settings.trackVisited) return false;
-        if (location.pathname === '/' || NON_ITEM_PATH.test(location.pathname)) return false;
-        let referrer;
-        try {
-            referrer = new URL(document.referrer);
-        } catch (error) {
-            return false;
-        }
-        if (referrer.hostname !== location.hostname) return false;
-        if (collectCards(document).length) return false;
+        if (!isItemPage()) return false;
 
         const url = normalizeUrl(location.href);
         const now = Date.now();
@@ -498,6 +500,36 @@
         visited.set(url, now);
         tombstones.delete(tombstoneKey('v', url));
         return true;
+    }
+
+    // What has to be ruled out is a listing page, and a same-origin referrer cannot do it:
+    // one listing links to the next, and a new tab may carry no referrer at all. Nor can
+    // "the page has cards": an item page that carries a related-items strip has cards too,
+    // and rejecting it is why a visit could go unrecorded even after the page had loaded.
+    // So the URL decides first, then what the page says about itself, and a page carrying
+    // cards is an item page when it also carries content those cards do not account for.
+    function isItemPage() {
+        if (location.pathname === '/' || NON_ITEM_PATH.test(location.pathname)) return false;
+        if (document.querySelector(ITEM_PAGE_META)) return true;
+        const cards = collectCards(document);
+        if (!cards.length) return true;
+        return hasContentOutsideCards(cards);
+    }
+
+    // An item page has content of its own—a title, a description, a file list—above
+    // whatever related cards follow it, where a listing page is very nearly nothing but
+    // its cards. A top-level heading that belongs to no card says so, and so does a body
+    // of text next to them; a listing's own text is its heading and its pagination. Where
+    // neither is decisive the page is not recorded, which costs a visit; recording a
+    // listing URL instead costs a history entry no card will ever match.
+    function hasContentOutsideCards(cards) {
+        const root = document.querySelector('main') || document.body;
+        if (!root) return false;
+        const isOutside = node => !cards.some(card => card.contains(node));
+        if ([...root.querySelectorAll('h1')].some(isOutside)) return true;
+        const total = (root.textContent || '').trim().length;
+        const outside = cards.reduce((rest, card) => rest - (card.textContent || '').trim().length, total);
+        return outside >= MIN_ITEM_TEXT;
     }
 
     async function migrateLegacyHistory() {

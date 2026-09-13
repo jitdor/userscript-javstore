@@ -127,6 +127,27 @@ export function listingHtml(cards) {
 export const detailHtml =
     '<!doctype html><html><head></head><body><main><article><h1>Item</h1></article></main></body></html>';
 
+// An item page as the site actually builds one: the post above a strip of related cards,
+// which is what makes "this page has cards" useless for telling it from a listing.
+export const detailWithRelatedHtml = (related = [['/b.html', 'Beta']]) =>
+    `<!doctype html><html><head></head><body><main>
+        <article><h1>Item</h1></article>
+        <div class="grid">${related.map(([href, title]) => cardHtml(href, title)).join('\n')}</div>
+    </main></body></html>`;
+
+// The browser's own menu drives "open link in new tab", so the page is told only that a
+// right-click happened: no click, and an auxclick for the right button rather than the
+// middle one. Picking "Copy link" or dismissing the menu looks exactly the same here.
+export function openInNewTabFromContextMenu(window, href) {
+    const target = card(window, href);
+    const init = { bubbles: true, cancelable: true, button: 2, buttons: 2 };
+    target.dispatchEvent(new window.MouseEvent('mousedown', init));
+    target.dispatchEvent(new window.MouseEvent('contextmenu', init));
+    target.dispatchEvent(new window.MouseEvent('mouseup', init));
+    target.dispatchEvent(new window.MouseEvent('auxclick', init));
+    return target;
+}
+
 export async function openTab(store, {
     html = listingHtml([]),
     url = 'https://javstore.net/',

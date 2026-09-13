@@ -1,8 +1,8 @@
 import test, { afterEach } from 'node:test';
 import assert from 'node:assert/strict';
 import {
-    makeStore, openTab, closeTabs, settle, listingHtml, detailHtml,
-    card, clickCard, pressOnCard, visitedUrls,
+    makeStore, openTab, closeTabs, settle, listingHtml, detailHtml, detailWithRelatedHtml,
+    card, clickCard, pressOnCard, openInNewTabFromContextMenu, visitedUrls,
 } from './harness.mjs';
 
 const CARDS = [['/a.html', 'Alpha'], ['/b.html', 'Beta'], ['/c.html', 'Gamma']];
@@ -105,6 +105,59 @@ test('landing on a detail page records the visit without a click', async () => {
     });
     await settle();
     assert.deepEqual(visitedUrls(store), ['https://javstore.net/b.html']);
+});
+
+test('opening a card from the context menu records the visit when its page loads', async () => {
+    const store = makeStore();
+    const listingTab = await openTab(store, { html: listing() });
+
+    // The right-click itself must not record anything: the page cannot tell "open in new
+    // tab" from "copy link", and the browser never reports which one was chosen.
+    openInNewTabFromContextMenu(listingTab.window, '/a.html');
+    await settle();
+    assert.deepEqual(visitedUrls(store), []);
+
+    // The new tab is a fresh one: no referrer of its own, and the item page carries the
+    // related cards a real one does.
+    await openTab(store, {
+        html: detailWithRelatedHtml(),
+        url: 'https://javstore.net/a.html',
+    });
+    await settle();
+    assert.deepEqual(visitedUrls(store), ['https://javstore.net/a.html']);
+
+    listingTab.window.dispatchEvent(new listingTab.window.Event('focus'));
+    await settle();
+    assert.ok(card(listingTab.window, '/a.html').classList.contains('jvs-visited'));
+});
+
+test('an item page carrying related cards is not mistaken for a listing', async () => {
+    const store = makeStore();
+    await openTab(store, {
+        html: detailWithRelatedHtml([['/b.html', 'Beta'], ['/c.html', 'Gamma']]),
+        url: 'https://javstore.net/a.html',
+        referrer: 'https://javstore.net/',
+    });
+    await settle();
+    assert.deepEqual(visitedUrls(store), ['https://javstore.net/a.html']);
+});
+
+test('an item page reached without a referrer is recorded', async () => {
+    const store = makeStore();
+    await openTab(store, { html: detailHtml, url: 'https://javstore.net/a.html' });
+    await settle();
+    assert.deepEqual(visitedUrls(store), ['https://javstore.net/a.html']);
+});
+
+test('a listing page on an unrecognized path is not recorded as a visit', async () => {
+    const store = makeStore();
+    await openTab(store, {
+        html: listing(),
+        url: 'https://javstore.net/newest',
+        referrer: 'https://javstore.net/',
+    });
+    await settle();
+    assert.deepEqual(visitedUrls(store), []);
 });
 
 test('a listing page is not recorded as a visit', async () => {
