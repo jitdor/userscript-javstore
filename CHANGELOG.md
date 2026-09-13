@@ -1,5 +1,11 @@
 # Changelog
 
+## 6.4.0
+
+- Fix: opening a card with the browser's own "open link in new tab" (right-click > open in new tab) now counts as a visit. The browser's context menu never tells the page which item was chosen—only a `contextmenu` event arrives, which is equally what "Copy link" or a dismissed menu looks like—so nothing was recorded, and only Ctrl/Cmd+click, middle-click and an ordinary click were, because those do send the page a click.
+- Fix: arriving on an item page records the visit on the page's own evidence rather than on a referrer. A new tab need not carry one, and a listing links to the next listing, so a referrer never separated the two cases it was asked to.
+- Fix: an item page that carries a strip of related cards is no longer read as a listing page and skipped. A page is taken for an item page when its URL is not a listing URL and it carries either a heading of its own or body text the cards do not account for; pages that say `og:type=article` are taken at their word.
+
 ## 6.3.2
 
 - Fix: a sync saves the history it pulled before recording the cursor that covers it. The cursor was written first, so a state write that was interrupted by a navigation—or refused by the userscript manager—left the device permanently past rows it had never stored: after a reload it asked only for changes after that cursor and those entries were never offered again.

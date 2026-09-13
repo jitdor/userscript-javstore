@@ -18,7 +18,7 @@ A Tampermonkey userscript that cleans up JavStore's layout, protects keyword-mat
 - Filters the page to all, unvisited, visited, or matched cards.
 - Reveals individual cards temporarily or toggles protection globally.
 - Synchronizes settings and history across tabs, merging rather than overwriting, and falls back to polling when the userscript manager cannot notify tabs of changes.
-- Replays clicks whose save was interrupted by the page unloading, and records a visit when a detail page is opened from JavStore.
+- Replays clicks whose save was interrupted by the page unloading, and records a visit whenever an item page is opened—including by the browser's own "open link in new tab", which reaches the page as no click at all.
 - Imports and exports settings, visited history, and per-card overrides as a JSON backup.
 - Optionally mirrors settings and history to a Cloudflare Worker you own, syncing only what changed, so history survives a userscript-manager reinstall and follows you between devices.
 
