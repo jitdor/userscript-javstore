@@ -1,5 +1,10 @@
 # Changelog
 
+## 6.4.2
+
+- Fix: a visit could be lost when a sibling tab's stale document landed between this tab's write and the read-back that checks it. The read-back then carries a newer timestamp, so the write looks good, while the visit it was meant to save has been clobbered out of it — and the replay note, the only copy left, was given up on that report. The note is now kept until the document that comes back from storage actually carries the click. This costs the visit outright when the tab does not navigate: an ordinary click replays the note on the page it opens, but Cmd-clicking a tile leaves the listing where it is, so a refresh is the next thing to read storage.
+- Add: a visit that does not come back from storage after a save is reported on the console, so a storage engine quietly dropping writes leaves a trace.
+
 ## 6.4.1
 
 - Fix: a visit recorded in one tab could be left on that device for good. A sync marks its moment and afterwards sends only entries stamped after it, but it built that claim from the tab's own in-memory copy of the history—and sibling tabs only ever write theirs to storage. So a tab that had not seen a visit another tab recorded would push nothing and still move the mark past it, and no later sync would ever offer that entry again: visited on the device that recorded it, absent on every other, and reported as "nothing new". A sync now merges the stored document before it decides what to send.
