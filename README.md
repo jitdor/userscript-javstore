@@ -34,10 +34,13 @@ Once it is deployed, open the `JVS` panel → **Cloud sync**, enter the worker U
 
 - Each device syncs on page load, when its tab regains focus, a few seconds after a visit, on the interval you choose, and whenever you press **Sync now**. The panel's status line reports the last sync or the reason the last one failed.
 - Devices exchange only what changed: each remembers the sequence number it last saw and the moment it last pushed, so an idle page load costs about 150 bytes each way rather than the whole history. The first sync on a device transfers everything.
+- Tabs on one device share a history but not a sync. Before deciding what to send, a sync merges what the device has on disk, so a visit recorded in one tab is not passed over by another tab's sync; and an entry that turns up stamped before the last push—a click replayed from the previous page, a restored backup—pulls the mark back to itself rather than being left behind it.
 - The worker applies the same rules as the local merge—newest timestamp wins per URL, tombstones and the clear/retention horizons outrank stale entries—so a device that has been offline for a week cannot overwrite what the others recorded, and clearing history on one device clears it everywhere instead of being undone. A device that pushes a stale entry is handed the winning one back.
 - Because a Durable Object is single-threaded, each sync's read-merge-write is serialized and strongly consistent: two devices syncing in the same second queue behind one another rather than racing.
 - The endpoint and token live only on the device they were entered on. They are never written into the synced document, never appear in an exported backup, and are not left in the page: the token box stays empty once a token is stored and only reports that one exists.
 - A worker that is unreachable does not affect anything locally: history is still saved to the userscript manager, and the next sync picks it up.
+- **Sync now** reports both directions—what went up and what came down—so a device that is failing to push is not mistaken for one with nothing to push.
+- Restoring a backup keeps the backup's own timestamps and records the entries it drops as removals, so the restore reaches the other devices instead of being discarded by them. Entries a history clear already covers cannot be restored, and the panel says how many were skipped.
 
 ## Controls
 

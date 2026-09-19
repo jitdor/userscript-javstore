@@ -1,5 +1,16 @@
 # Changelog
 
+## 6.4.1
+
+- Fix: a visit recorded in one tab could be left on that device for good. A sync marks its moment and afterwards sends only entries stamped after it, but it built that claim from the tab's own in-memory copy of the history—and sibling tabs only ever write theirs to storage. So a tab that had not seen a visit another tab recorded would push nothing and still move the mark past it, and no later sync would ever offer that entry again: visited on the device that recorded it, absent on every other, and reported as "nothing new". A sync now merges the stored document before it decides what to send.
+- Fix: an entry that reaches a device stamped in the past is no longer swallowed by the same mark. A click replayed from the previous page, a restored backup, or anything else adopted from storage behind the mark now pulls it back so the next sync rescans from there.
+- Fix: "Import backup" no longer destroys the history it is restoring. It cleared the way with a full-history reset stamped at the moment of the import, and a backup is by definition older than that, so the worker and every other device dropped the restored entries on sight while the importing tab kept them—a device that looked restored and synced nothing. A restore now records what it drops entry by entry, so the removals still travel, and the backup's own timestamps survive.
+- Fix: a sync that runs out of page budget with entries still to send no longer retires them unsent.
+- Fix: a visit recorded while a sync was saving could not arm the push timer and waited for the next poll; it is now sent as soon as the sync finishes.
+- Fix: a per-card override carrying no timestamp—as documents written by 6.0.0 and 6.1.0 do—is dated to the document it was found in rather than being refused by the worker forever.
+- Fix: an override and a removal stamped at the same moment settle the same way on the device as on the worker, which is in the removal's favour.
+- Change: "Sync now" reports both directions ("Synced: 3 sent up, remote history merged in"). It described only what had come down, so a device that was failing to push looked exactly like one with nothing to push.
+
 ## 6.4.0
 
 - Fix: opening a card with the browser's own "open link in new tab" (right-click > open in new tab) now counts as a visit. The browser's context menu never tells the page which item was chosen—only a `contextmenu` event arrives, which is equally what "Copy link" or a dismissed menu looks like—so nothing was recorded, and only Ctrl/Cmd+click, middle-click and an ordinary click were, because those do send the page a click.

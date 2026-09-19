@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         JavStore Full Layout Cleanup - No Sidebars + Mosaic Overlay
 // @namespace    http://tampermonkey.net/
-// @version      6.4.0
+// @version      6.4.1
 // @description  Clean up JavStore's layout, filter keyword-matched thumbnails, and track visited items with private, configurable controls.
 // @homepageURL  https://github.com/jitdor/userscript-javstore
 // @supportURL   https://github.com/jitdor/userscript-javstore/issues
@@ -21,7 +21,7 @@
 (function () {
     'use strict';
 
-    const SCRIPT_VERSION = '6.4.0';
+    const SCRIPT_VERSION = '6.4.1';
     const STORAGE_VERSION = 3;
     const STORAGE_KEY = 'javstore_cleanup_state_v2';
     const LEGACY_STORAGE_KEY = 'javstore_seen_links';
@@ -101,6 +101,7 @@
     let writeQueue = Promise.resolve(false);
     let syncConfig = { ...DEFAULT_SYNC_CONFIG };
     let remoteQueue = Promise.resolve(false);
+    let pendingHorizonWrite = Promise.resolve();
     let remotePushTimer = 0;
     let remotePollTimer = 0;
     let lastRemoteAttemptAt = 0;
@@ -114,6 +115,15 @@
     // different. That still has to reach storage, so the last merge also records whether it
     // adopted anything at all.
     let lastMergeAdopted = false;
+    // The oldest entry the last merge took on that the push horizon has already moved
+    // past. Such an entry would never be offered to the worker again, so the horizon is
+    // pulled back to it; `mergeStoredState` only reports it, because it also runs while
+    // remote rows are being folded in, where the horizon must not move at all.
+    let lastMergeBackdatedTo = 0;
+    // A local change made while a sync was writing could not arm the push timer, because
+    // arming it there would have the sync push its own merge straight back. The change
+    // still has to go up, so the sync re-arms it once it is done.
+    let deferredRemotePush = false;
     let syncTimer = 0;
     let storageAvailable = true;
     let observer = null;
@@ -278,7 +288,16 @@
     // tombstone, or `resetAt` for a full clear) so that merging cannot resurrect them.
     function mergeStoredState(stored, { adoptSettings = false } = {}) {
         lastMergeAdopted = false;
+        lastMergeBackdatedTo = 0;
         if (!stored || typeof stored !== 'object') return false;
+
+        // An entry is "backdated" when it is stamped before this device's push horizon:
+        // it was recorded somewhere this device had not looked—another tab, a replayed
+        // click, a restored backup—so the horizon has already swept past it.
+        const backdated = at => {
+            if (!at || !pushHorizon() || at >= pushHorizon()) return;
+            lastMergeBackdatedTo = lastMergeBackdatedTo ? Math.min(lastMergeBackdatedTo, at) : at;
+        };
 
         const remoteVisited = parseVisited(stored.visited);
         const remoteOverrides = parseOverrides(stored.overrides);
@@ -326,6 +345,7 @@
             if (at <= (tombstones.get(key) || 0)) continue;
             tombstones.set(key, at);
             adopted = true;
+            backdated(at);
             const url = key.slice(2);
             if (key.startsWith('v|')) {
                 if (visited.has(url) && visited.get(url) <= at) {
@@ -345,16 +365,29 @@
             if (at <= resetAt || at <= prunedBefore || at <= tombstoneTime('v', url)) continue;
             if (at <= (visited.get(url) || 0)) continue;
             visited.set(url, at);
+            backdated(at);
             changed = true;
         }
 
         for (const [url, value] of remoteOverrides) {
             const at = remoteOverrideTimes.get(url) || 0;
-            if (at < tombstoneTime('o', url)) continue;
+            // The worker settles a tie in a deletion's favour, so the same rule has to
+            // apply here or the two sides stop converging on the same state.
+            if (at <= tombstoneTime('o', url)) continue;
             if (at < (overrideTimes.get(url) || 0)) continue;
-            if (overrides.get(url) === value) continue;
+            if (overrides.get(url) === value) {
+                // Same choice, newer stamp: recording it is what stops this device
+                // offering the older one back on every sync from here on.
+                if (at > (overrideTimes.get(url) || 0)) {
+                    overrideTimes.set(url, at);
+                    adopted = true;
+                    backdated(at);
+                }
+                continue;
+            }
             overrides.set(url, value);
             overrideTimes.set(url, at);
+            backdated(at);
             changed = true;
         }
 
@@ -389,6 +422,7 @@
         for (let attempt = 0; attempt < 2; attempt += 1) {
             try {
                 mergeStoredState(await readStoredState());
+                notePushBacklog();
                 pruneVisited();
                 const payload = serializeState();
                 await Promise.resolve(GM_setValue(STORAGE_KEY, payload));
@@ -478,6 +512,9 @@
             if (at <= resetAt || at <= prunedBefore || at <= tombstoneTime('v', url)) return;
             if (at <= (visited.get(url) || 0)) return;
             visited.set(url, at);
+            // The click happened before this page loaded, and possibly before the last
+            // push: without pulling the horizon back it would never be offered upstream.
+            lowerPushHorizon(at);
             changed = true;
         });
         return changed;
@@ -592,6 +629,11 @@
         }
         for (const url of overrideTimes.keys()) {
             if (!overrides.has(url)) overrideTimes.delete(url);
+        }
+        // An override with no timestamp is one the worker will refuse and this device will
+        // never stop holding, so it is dated to the document it was found in.
+        for (const url of overrides.keys()) {
+            if (!overrideTimes.get(url)) overrideTimes.set(url, lastKnownUpdatedAt || now);
         }
     }
 
@@ -754,6 +796,50 @@
         });
     }
 
+    // How far this device's pushes have got. Only meaningful against the worker it was
+    // recorded from, so pointing the panel elsewhere reads it as zero.
+    function pushHorizon() {
+        return syncConfig.remoteKey === syncConfig.endpoint ? syncConfig.pushedAt : 0;
+    }
+
+    // The horizon is a wall-clock high-water mark: a sync declares "everything stamped
+    // before now is upstream". That claim is only true of entries the syncing tab could
+    // see, and an entry can reach this device stamped in the past—another tab recorded it
+    // while this one was not looking, a click was replayed from the previous page, a
+    // backup was restored. Such an entry is behind the horizon the moment it arrives and
+    // would never be offered again, which is how a visit ends up on one device for good.
+    // So the horizon is pulled back to it, and the next sync rescans from there. The cost
+    // is re-offering a few entries the worker already has, which it discards on arrival.
+    function lowerPushHorizon(at) {
+        const time = parseTimestamp(at);
+        if (!syncConfigured() || !time) return;
+        const horizon = pushHorizon();
+        if (!horizon || time >= horizon) return;
+        syncConfig = { ...syncConfig, pushedAt: time };
+        // Persisted through a read-modify-write that can only ever lower the stored
+        // value: another tab may have moved it on legitimately in the meantime, and this
+        // must not become a way to undo that.
+        pendingHorizonWrite = pendingHorizonWrite.then(async () => {
+            // A sync that ran in the meantime has pushed everything from here anyway, and
+            // its horizon is then the authority: dragging it back would only cost a round
+            // trip. Anything still holding this value has not been superseded.
+            if (syncConfig.pushedAt !== time) return;
+            const stored = await readSyncConfig();
+            if (stored.remoteKey !== syncConfig.endpoint || !stored.pushedAt) return;
+            if (stored.pushedAt <= time) return;
+            await writeSyncConfig({ ...stored, pushedAt: time });
+        }, () => {});
+    }
+
+    // Called after every merge of a document this device stores itself, so that whatever
+    // the merge took on from another tab is pushed rather than silently swallowed. Remote
+    // rows are excluded: they came from the worker, so re-offering them is pure waste.
+    function notePushBacklog() {
+        const at = lastMergeBackdatedTo;
+        lastMergeBackdatedTo = 0;
+        if (at && !applyingRemoteState) lowerPushHorizon(at);
+    }
+
     // The entries this device has touched since its last successful push. Everything
     // recorded locally is stamped with the current time, so a single high-water mark is
     // enough to find them—and entries that arrived from the worker are always older than
@@ -830,6 +916,17 @@
         try {
             // Let any local write finish first so what gets pushed is the current state.
             await writeQueue.catch(() => false);
+
+            // Read before the horizon is taken, so nothing recorded between the two can
+            // fall into the gap.
+            const horizon = Date.now();
+            // Sibling tabs keep their own copy of the document and only write it to
+            // storage; nothing tells this one that they have. Pushing from memory alone is
+            // therefore pushing a stale document, and since the horizon afterwards claims
+            // everything older than now is upstream, a visit another tab recorded is
+            // stranded on this device for good. So the stored document is merged in first:
+            // what this sync is about to declare pushed, it has now actually seen.
+            applyStoredState(await readStoredState());
             pruneVisited();
 
             // The cursor and the high-water mark only mean anything against the worker they
@@ -838,8 +935,8 @@
             let cursor = sameRemote ? syncConfig.cursor : 0;
             const pushedAt = sameRemote ? syncConfig.pushedAt : 0;
 
-            const horizon = Date.now();
             let outgoing = localChangesSince(pushedAt);
+            let sent = 0;
             let changed = false;
             let absorbed = false;
             let legacy = false;
@@ -869,6 +966,7 @@
                 }
 
                 outgoing = outgoing.slice(batch.length);
+                sent += batch.length;
                 cursor = Math.max(0, Number(answer.cursor) || 0);
                 applyingRemoteState = true;
                 if (applyStoredState(documentFromRows(answer.changes, answer.meta))) changed = true;
@@ -894,16 +992,33 @@
 
             // Only recorded after the exchange succeeded: a failed sync has to send the same
             // entries again rather than assume the worker took them.
+            // The horizon may only cover what actually went up. `outgoing` is still
+            // holding entries when the page budget ran out before they could be sent, and
+            // moving the horizon past them would retire them unsent.
+            const unsent = outgoing.reduce((oldest, change) => (
+                oldest ? Math.min(oldest, change.at) : change.at
+            ), 0);
+            // And something backdated may have arrived after this sync chose what to send,
+            // which pulled the horizon below where the exchange started. That entry was
+            // never offered, so the sync cannot claim it.
+            const arrived = syncConfig.pushedAt < pushedAt ? syncConfig.pushedAt : horizon;
             await writeSyncConfig({
                 ...syncConfig,
                 cursor: legacy ? 0 : cursor,
-                pushedAt: legacy ? 0 : horizon,
+                pushedAt: legacy ? 0 : Math.min(horizon, unsent || horizon, arrived),
                 remoteKey: legacy ? '' : syncConfig.endpoint,
             });
 
             lastRemoteSyncAt = Date.now();
             lastRemoteError = '';
-            if (manual) showToast(changed ? 'Synced. Remote history merged in.' : 'Synced. Nothing new.');
+            if (manual) {
+                // Both directions, because a device that is quietly failing to push looks
+                // exactly like one with nothing to push when only the pull is reported.
+                const report = [];
+                if (sent) report.push(`${sent} sent up`);
+                if (changed) report.push('remote history merged in');
+                showToast(report.length ? `Synced: ${report.join(', ')}.` : 'Synced. Nothing new either way.');
+            }
             return changed;
         } catch (error) {
             lastRemoteError = String(error?.message || 'sync failed');
@@ -913,12 +1028,20 @@
         } finally {
             applyingRemoteState = false;
             remoteSyncRunning = false;
+            if (deferredRemotePush) {
+                deferredRemotePush = false;
+                scheduleRemotePush();
+            }
             scheduleCountUpdate();
         }
     }
 
     function scheduleRemotePush() {
-        if (!syncConfigured() || applyingRemoteState) return;
+        if (!syncConfigured()) return;
+        if (applyingRemoteState) {
+            deferredRemotePush = true;
+            return;
+        }
         window.clearTimeout(remotePushTimer);
         remotePushTimer = window.setTimeout(() => queueSync(), REMOTE_PUSH_DEBOUNCE_MS);
     }
@@ -1578,22 +1701,58 @@
                 : raw;
             if (!parsed || typeof parsed !== 'object') throw new Error('Invalid backup');
             if (!window.confirm('Replace current settings, history, and per-card overrides with this backup?')) return;
+            const now = Date.now();
+            const restored = parseVisited(parsed.visited);
+            const restoredOverrides = parseOverrides(parsed.overrides);
+            const restoredOverrideTimes = parseTimestamps(parsed.overrideTimes);
+
+            // A backup is by definition older than the moment it is restored, so clearing
+            // the way for it with a `resetAt` of now would delete the very entries it
+            // carries—on every other device and on the worker, which both drop anything
+            // stamped at or before the reset. What the restore actually drops is recorded
+            // entry by entry instead, which travels without taking the restored history
+            // with it and leaves its timestamps intact.
+            for (const url of visited.keys()) {
+                if (!restored.has(url)) tombstones.set(tombstoneKey('v', url), now);
+            }
+            for (const url of overrides.keys()) {
+                if (!restoredOverrides.has(url)) tombstones.set(tombstoneKey('o', url), now);
+            }
+            // A restored entry outranks any removal this device was still carrying for it.
+            for (const url of restored.keys()) tombstones.delete(tombstoneKey('v', url));
+            for (const url of restoredOverrides.keys()) tombstones.delete(tombstoneKey('o', url));
+
             settings = sanitizeSettings(parsed.settings);
-            settingsUpdatedAt = Date.now();
-            resetAt = Date.now();
-            visited = parseVisited(parsed.visited);
-            overrides = parseOverrides(parsed.overrides);
-            overrideTimes = parseTimestamps(parsed.overrideTimes);
-            for (const key of tombstones.keys()) {
-                if (key.startsWith('v|')) tombstones.delete(key);
+            settingsUpdatedAt = now;
+            visited = restored;
+            overrides = restoredOverrides;
+            overrideTimes = restoredOverrideTimes;
+            // The backup's own horizons are adopted if they are ahead of this device's;
+            // neither is ever moved back, so a clear that happened after the backup was
+            // taken still stands, and what it covers cannot be restored.
+            resetAt = Math.max(resetAt, parseTimestamp(parsed.resetAt));
+            prunedBefore = Math.max(prunedBefore, parseTimestamp(parsed.prunedBefore));
+            let skipped = 0;
+            for (const [url, at] of visited) {
+                if (at <= resetAt || at <= prunedBefore) {
+                    visited.delete(url);
+                    skipped += 1;
+                }
             }
             pruneVisited();
+            // Everything restored is stamped in the past, so without this the push horizon
+            // would already be sitting in front of it and none of it would ever go up.
+            const oldest = [...visited.values(), ...overrideTimes.values()]
+                .reduce((least, at) => (least ? Math.min(least, at) : at), 0);
+            lowerPushHorizon(oldest);
             persistState();
             setRootState();
             processAllCards();
             fillSettingsForm();
             updateUi();
-            showToast('Backup imported.');
+            showToast(skipped
+                ? `Backup imported. ${skipped} entries predate a history clear and were skipped.`
+                : 'Backup imported.');
         } catch (error) {
             showToast('Import failed: the selected file is not a valid backup.', true);
         }
@@ -1851,7 +2010,9 @@
     }
 
     function applyStoredState(stored) {
-        if (!mergeStoredState(stored, { adoptSettings: true })) return false;
+        const merged = mergeStoredState(stored, { adoptSettings: true });
+        notePushBacklog();
+        if (!merged) return false;
         pruneVisited();
         setRootState();
         processAllCards();
