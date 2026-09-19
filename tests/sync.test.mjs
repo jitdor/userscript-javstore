@@ -566,3 +566,174 @@ test('a history left behind in the KV namespace is imported once', async () => {
     assert.ok(card(tab.window, '/a.html').classList.contains('jvs-visited'));
     assert.equal(tab.shadow().querySelector('form.settings-form').elements.mode.value, 'blur');
 });
+
+// ------------------------------------------------------------------
+// The push horizon
+//
+// A sync declares "everything stamped before now is upstream" and records the moment as a
+// high-water mark. That claim is only true of the entries the syncing tab could see, and
+// an entry can reach a device stamped in the past: another tab recorded it, a click was
+// replayed from the previous page, a backup was restored. Each of these used to leave the
+// entry sitting behind the mark, where nothing would ever offer it again—visible on the
+// device that recorded it, absent everywhere else, and reported as "nothing new".
+// ------------------------------------------------------------------
+
+test('a visit recorded in one tab is not stranded by another tab syncing', async () => {
+    const remote = makeRemote();
+    const store = makeStore();
+    enableSync(store, remote);
+
+    const idle = await openTab(store, { html: listing(), remote });
+    await settle();
+    const active = await openTab(store, { html: listing(), remote });
+    await settle();
+
+    // Recorded in the second tab, which then goes away before its push can fire.
+    clickCard(active.window, '/a.html');
+    await settle();
+    assert.deepEqual(visitedUrls(store), ['https://javstore.net/a.html']);
+    active.window.close();
+
+    // The first tab has never seen it, and syncing must not claim it has been pushed.
+    await syncNow(idle);
+    assert.deepEqual(remote.visited(), ['https://javstore.net/a.html']);
+
+    const elsewhere = makeStore();
+    const other = await openDevice(remote, { store: elsewhere });
+    assert.ok(card(other.window, '/a.html').classList.contains('jvs-visited'));
+});
+
+test('a click replayed from the previous page reaches the worker', async () => {
+    const remote = makeRemote();
+    const store = makeStore();
+    enableSync(store, remote);
+    const first = await openTab(store, { html: listing(), remote });
+    await settle();
+    await syncNow(first);
+
+    // What a dropped GM write leaves behind: a click stamped before the last push, which
+    // only the next page load in that tab will find.
+    const config = JSON.parse(store.data.get('javstore_sync_config_v1'));
+    const session = new Map([['javstore_pending_visits', JSON.stringify([
+        { url: 'https://javstore.net/c.html', at: config.pushedAt - 5000 },
+    ])]]);
+    first.window.close();
+
+    const next = await openTab(store, { html: listing(), remote, session });
+    await settle();
+    await syncNow(next);
+    assert.deepEqual(remote.visited(), ['https://javstore.net/c.html']);
+});
+
+test('an imported backup reaches the other devices', async () => {
+    const remote = makeRemote();
+    const store = makeStore();
+    enableSync(store, remote);
+    const tab = await openTab(store, { html: listing(), remote });
+    await settle();
+
+    const at = Date.now() - 86400000;
+    const input = tab.shadow().querySelector('.import-file');
+    Object.defineProperty(input, 'files', {
+        configurable: true,
+        value: [{
+            text: async () => JSON.stringify({
+                version: 3,
+                updatedAt: at,
+                visited: { 'https://javstore.net/a.html': at },
+                overrides: {},
+                overrideTimes: {},
+                tombstones: {},
+            }),
+        }],
+    });
+    input.dispatchEvent(new tab.window.Event('change'));
+    await settle();
+
+    await syncNow(tab);
+    assert.deepEqual(remote.visited(), ['https://javstore.net/a.html']);
+    // The backup's own timestamp survives the restore, rather than being rewritten to the
+    // moment it was imported.
+    assert.equal(remote.state().visited['https://javstore.net/a.html'], at);
+
+    const elsewhere = makeStore();
+    const other = await openDevice(remote, { store: elsewhere });
+    assert.deepEqual(visitedUrls(elsewhere), ['https://javstore.net/a.html']);
+});
+
+test('an import records what it drops so the removal travels too', async () => {
+    const remote = makeRemote();
+    const first = await openDevice(remote);
+    clickCard(first.window, '/a.html');
+    clickCard(first.window, '/b.html');
+    await settle();
+    await syncNow(first);
+
+    const secondStore = makeStore();
+    const second = await openDevice(remote, { store: secondStore });
+    assert.deepEqual(visitedUrls(secondStore), ['https://javstore.net/a.html', 'https://javstore.net/b.html']);
+
+    const at = Date.now() - 86400000;
+    const input = second.shadow().querySelector('.import-file');
+    Object.defineProperty(input, 'files', {
+        configurable: true,
+        value: [{
+            text: async () => JSON.stringify({
+                version: 3,
+                updatedAt: at,
+                visited: { 'https://javstore.net/a.html': at },
+                overrides: {},
+                overrideTimes: {},
+                tombstones: {},
+            }),
+        }],
+    });
+    input.dispatchEvent(new second.window.Event('change'));
+    await settle();
+    await syncNow(second);
+
+    assert.deepEqual(remote.visited(), ['https://javstore.net/a.html']);
+    await syncNow(first);
+    assert.deepEqual(visitedUrls(first.store), ['https://javstore.net/a.html']);
+});
+
+test('a visit recorded while a sync is in flight is not declared pushed', async () => {
+    const remote = makeRemote();
+    const store = makeStore();
+    enableSync(store, remote);
+    const first = await openTab(store, { html: listing(), remote });
+    await settle();
+    const second = await openTab(store, { html: listing(), remote });
+    await settle();
+    await syncNow(first);
+
+    const reach = remote.handle.bind(remote);
+    remote.handle = async request => {
+        await new Promise(resolve => setTimeout(resolve, 150));
+        return reach(request);
+    };
+    const syncing = syncNow(first);
+    await new Promise(resolve => setTimeout(resolve, 40));
+    clickCard(second.window, '/b.html');
+    await settle();
+    second.window.close();
+    await syncing;
+    remote.handle = reach;
+
+    const later = await openTab(store, { html: listing(), remote });
+    await settle();
+    await syncNow(later);
+    assert.ok(remote.visited().includes('https://javstore.net/b.html'));
+});
+
+test('a manual sync reports what went up, not only what came down', async () => {
+    const remote = makeRemote();
+    const tab = await openDevice(remote);
+    clickCard(tab.window, '/a.html');
+    await settle();
+    await syncNow(tab);
+    assert.match(tab.shadow().querySelector('.toast').textContent, /sent up/);
+
+    await syncNow(tab);
+    assert.match(tab.shadow().querySelector('.toast').textContent, /Nothing new either way/);
+});
