@@ -210,3 +210,56 @@ test('per-card overrides survive a write from a tab holding an older snapshot', 
     await settle();
     assert.equal(store.state().overrides['https://javstore.net/b.html'], 'allow');
 });
+
+// A sibling tab's stale document can land between this tab's write and the read-back
+// that checks it. The read-back then carries a newer timestamp — so the write looks
+// good — while the visit it was supposed to save has been clobbered out of it. The
+// replay note is the only copy left, and it matters most exactly here: Cmd-clicking a
+// tile leaves the listing where it is, so nothing re-reads storage until the user
+// refreshes, and a note given up on that report takes the visit with it.
+test('a visit clobbered between the write and the read-back is replayed', async () => {
+    const store = makeStore();
+    const session = new Map();
+    const tiles = [['/a.html', 'Alpha'], ['/b.html', 'Beta']];
+    const clicked = ['https://javstore.net/a.html', 'https://javstore.net/b.html'];
+
+    const listingTab = await openTab(store, {
+        html: listingHtml(tiles), url: 'https://javstore.net/', session,
+    });
+    await settle();
+
+    let clobbering = true;
+    const write = store.set.bind(store);
+    store.set = async (key, value) => {
+        await write(key, value);
+        if (key !== 'javstore_cleanup_state_v2' || !clobbering) return;
+        // What another tab holding a pre-click snapshot writes a moment later.
+        const stale = JSON.parse(store.data.get(key));
+        clicked.forEach(url => { delete stale.visited[url]; });
+        stale.updatedAt += 1000;
+        store.data.set(key, JSON.stringify(stale));
+    };
+
+    clickCard(listingTab.window, '/a.html');
+    clickCard(listingTab.window, '/b.html');
+    await settle();
+    assert.ok(card(listingTab.window, '/a.html').classList.contains('jvs-visited'));
+    assert.deepEqual(visitedUrls(store), [], 'the sibling tab clobbered both out of storage');
+
+    assert.deepEqual(
+        JSON.parse(session.get('javstore_pending_visits') || '[]').map(entry => entry.url).sort(),
+        clicked,
+        'the replay note is kept, because storage did not come back carrying the clicks',
+    );
+
+    // The user refreshes the listing, which is the next thing to read storage.
+    clobbering = false;
+    listingTab.window.close();
+    const reloaded = await openTab(store, {
+        html: listingHtml(tiles), url: 'https://javstore.net/', session,
+    });
+    await settle();
+    assert.ok(card(reloaded.window, '/a.html').classList.contains('jvs-visited'), '/a.html came back');
+    assert.ok(card(reloaded.window, '/b.html').classList.contains('jvs-visited'), '/b.html came back');
+    assert.deepEqual(visitedUrls(store), clicked);
+});

@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         JavStore Full Layout Cleanup - No Sidebars + Mosaic Overlay
 // @namespace    http://tampermonkey.net/
-// @version      6.4.1
+// @version      6.4.2
 // @description  Clean up JavStore's layout, filter keyword-matched thumbnails, and track visited items with private, configurable controls.
 // @homepageURL  https://github.com/jitdor/userscript-javstore
 // @supportURL   https://github.com/jitdor/userscript-javstore/issues
@@ -21,7 +21,7 @@
 (function () {
     'use strict';
 
-    const SCRIPT_VERSION = '6.4.1';
+    const SCRIPT_VERSION = '6.4.2';
     const STORAGE_VERSION = 3;
     const STORAGE_KEY = 'javstore_cleanup_state_v2';
     const LEGACY_STORAGE_KEY = 'javstore_seen_links';
@@ -437,7 +437,7 @@
                 lastSavedAt = Date.now();
                 lastSaveFailed = false;
                 storageAvailable = true;
-                clearPendingVisits(startedAt);
+                clearPendingVisits(startedAt, verified);
                 scheduleCountUpdate();
                 return true;
             } catch (error) {
@@ -497,8 +497,35 @@
         writePendingVisits(entries);
     }
 
-    function clearPendingVisits(savedAt) {
-        const entries = readPendingVisits().filter(entry => entry.at > savedAt);
+    // The note is the only copy of a click whose real write is still in flight, so it is
+    // given up only once the document that came back from storage actually carries that
+    // click. "The write returned a newer timestamp" is a weaker claim than it looks: the
+    // entry can be dropped on the way—merged away by a tombstone, taken by a prune—and a
+    // storage engine that answers a read from a cache it has not persisted reports
+    // success for a value the next page load will not see. That last case is invisible
+    // without this check, and it costs the visit outright when the tab does not navigate:
+    // an ordinary click replays the note on the page it opens, but Cmd-clicking a tile
+    // leaves the listing where it is, so a refresh is the next thing to read storage.
+    // Entries the clear and retention horizons legitimately exclude are dropped rather
+    // than replayed for the life of the tab.
+    function clearPendingVisits(savedAt, stored) {
+        // Both sides are already normalized, so the stored document is indexed directly
+        // rather than reparsed—this runs on every save.
+        const landed = stored && typeof stored.visited === 'object' && stored.visited
+            ? stored.visited
+            : {};
+        let held = 0;
+        const entries = readPendingVisits().filter(entry => {
+            if (entry.at > savedAt) return true;
+            if (entry.at <= resetAt || entry.at <= prunedBefore) return false;
+            if (entry.at <= tombstoneTime('v', entry.url)) return false;
+            if (parseTimestamp(landed[entry.url]) >= entry.at) return false;
+            held += 1;
+            return true;
+        });
+        if (held) {
+            console.warn(`[JVS] ${held} visit(s) did not come back from storage after saving; keeping the replay note.`);
+        }
         writePendingVisits(entries);
     }
 
