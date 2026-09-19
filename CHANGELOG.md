@@ -1,5 +1,9 @@
 # Changelog
 
+## 6.4.3
+
+- Fix: restoring a backup no longer discards the browsing done since that backup was taken. A restore records what it drops as removals so they travel to the other devices, but it was reading the backup's silence about a *newer* visit as a removal too — and a backup cannot say anything about a visit recorded after it. An export, some browsing, then a restore of that same file therefore deleted the browsing in between, on every device at once. Entries newer than the backup are now carried into the restored document instead, and only what the backup could have known about is tombstoned.
+
 ## 6.4.2
 
 - Fix: a visit could be lost when a sibling tab's stale document landed between this tab's write and the read-back that checks it. The read-back then carries a newer timestamp, so the write looks good, while the visit it was meant to save has been clobbered out of it — and the replay note, the only copy left, was given up on that report. The note is now kept until the document that comes back from storage actually carries the click. This costs the visit outright when the tab does not navigate: an ordinary click replays the note on the page it opens, but Cmd-clicking a tile leaves the listing where it is, so a refresh is the next thing to read storage.

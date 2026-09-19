@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         JavStore Full Layout Cleanup - No Sidebars + Mosaic Overlay
 // @namespace    http://tampermonkey.net/
-// @version      6.4.2
+// @version      6.4.3
 // @description  Clean up JavStore's layout, filter keyword-matched thumbnails, and track visited items with private, configurable controls.
 // @homepageURL  https://github.com/jitdor/userscript-javstore
 // @supportURL   https://github.com/jitdor/userscript-javstore/issues
@@ -21,7 +21,7 @@
 (function () {
     'use strict';
 
-    const SCRIPT_VERSION = '6.4.2';
+    const SCRIPT_VERSION = '6.4.3';
     const STORAGE_VERSION = 3;
     const STORAGE_KEY = 'javstore_cleanup_state_v2';
     const LEGACY_STORAGE_KEY = 'javstore_seen_links';
@@ -1739,11 +1739,28 @@
             // stamped at or before the reset. What the restore actually drops is recorded
             // entry by entry instead, which travels without taking the restored history
             // with it and leaves its timestamps intact.
-            for (const url of visited.keys()) {
-                if (!restored.has(url)) tombstones.set(tombstoneKey('v', url), now);
+            //
+            // Only what the backup could have known about, though. A backup cannot say
+            // anything about a visit recorded after it was taken, so its silence about
+            // one is not a removal—and reading it as one quietly discards the browsing
+            // done between the export and the restore, on every device at once, which is
+            // the shape of an export/restore round trip done to repair something else.
+            // Those entries are kept and carried into the restored document instead.
+            const takenAt = parseTimestamp(parsed.updatedAt) || now;
+            for (const [url, at] of visited) {
+                if (restored.has(url)) continue;
+                if (at > takenAt) restored.set(url, at);
+                else tombstones.set(tombstoneKey('v', url), now);
             }
             for (const url of overrides.keys()) {
-                if (!restoredOverrides.has(url)) tombstones.set(tombstoneKey('o', url), now);
+                if (restoredOverrides.has(url)) continue;
+                const at = overrideTimes.get(url) || 0;
+                if (at > takenAt) {
+                    restoredOverrides.set(url, overrides.get(url));
+                    restoredOverrideTimes.set(url, at);
+                } else {
+                    tombstones.set(tombstoneKey('o', url), now);
+                }
             }
             // A restored entry outranks any removal this device was still carrying for it.
             for (const url of restored.keys()) tombstones.delete(tombstoneKey('v', url));

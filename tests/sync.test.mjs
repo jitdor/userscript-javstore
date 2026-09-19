@@ -673,6 +673,8 @@ test('an import records what it drops so the removal travels too', async () => {
     const second = await openDevice(remote, { store: secondStore });
     assert.deepEqual(visitedUrls(secondStore), ['https://javstore.net/a.html', 'https://javstore.net/b.html']);
 
+    // A backup taken now, deliberately without /b.html: the restore is asking for it to
+    // be gone, and the backup is new enough to be speaking about it.
     const at = Date.now() - 86400000;
     const input = second.shadow().querySelector('.import-file');
     Object.defineProperty(input, 'files', {
@@ -680,7 +682,7 @@ test('an import records what it drops so the removal travels too', async () => {
         value: [{
             text: async () => JSON.stringify({
                 version: 3,
-                updatedAt: at,
+                updatedAt: Date.now(),
                 visited: { 'https://javstore.net/a.html': at },
                 overrides: {},
                 overrideTimes: {},
@@ -736,4 +738,48 @@ test('a manual sync reports what went up, not only what came down', async () => 
 
     await syncNow(tab);
     assert.match(tab.shadow().querySelector('.toast').textContent, /Nothing new either way/);
+});
+
+test('a restore does not discard browsing done since the backup was taken', async () => {
+    const remote = makeRemote();
+    const store = makeStore();
+    const tab = await openDevice(remote, { store });
+
+    // Visited before the backup, and kept by it.
+    clickCard(tab.window, '/a.html');
+    await settle();
+    await syncNow(tab);
+    const backup = JSON.parse(JSON.stringify({
+        version: 3,
+        updatedAt: Date.now(),
+        visited: { 'https://javstore.net/a.html': store.state().visited['https://javstore.net/a.html'] },
+        overrides: {},
+        overrideTimes: {},
+        tombstones: {},
+    }));
+
+    // Then the user carries on browsing before restoring that same file.
+    await new Promise(resolve => setTimeout(resolve, 5));
+    clickCard(tab.window, '/b.html');
+    await settle();
+    await syncNow(tab);
+    assert.deepEqual(remote.visited(), ['https://javstore.net/a.html', 'https://javstore.net/b.html']);
+
+    const input = tab.shadow().querySelector('.import-file');
+    Object.defineProperty(input, 'files', {
+        configurable: true,
+        value: [{ text: async () => JSON.stringify(backup) }],
+    });
+    input.dispatchEvent(new tab.window.Event('change'));
+    await settle();
+    await syncNow(tab);
+
+    // The backup could not know about /b.html, so its silence is not a removal.
+    assert.deepEqual(visitedUrls(store), ['https://javstore.net/a.html', 'https://javstore.net/b.html']);
+    assert.deepEqual(remote.visited(), ['https://javstore.net/a.html', 'https://javstore.net/b.html']);
+
+    // And a second device is not told to delete it either.
+    const elsewhere = makeStore();
+    await openDevice(remote, { store: elsewhere });
+    assert.deepEqual(visitedUrls(elsewhere), ['https://javstore.net/a.html', 'https://javstore.net/b.html']);
 });
