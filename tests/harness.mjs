@@ -14,24 +14,43 @@ const source = fs.readFileSync(scriptPath, 'utf8');
 const openWindows = new Set();
 
 // Stands in for AdGuard's userscript engine: one shared value store, asynchronous
-// GM_getValue/GM_setValue, and neither GM_addValueChangeListener nor GM_registerMenuCommand.
-export function makeStore() {
+// GM_getValue/GM_setValue/GM_listValues/GM_deleteValue, and neither
+// GM_addValueChangeListener nor GM_registerMenuCommand. `latency` delays every call by a
+// random amount up to that many milliseconds, which is what lets saves from several tabs
+// overlap the way they do on a slow engine. `journaling: false` leaves out the two calls
+// the per-page journals need, for engines that do not provide them.
+export function makeStore({ latency = 0, journaling = true } = {}) {
     const data = new Map();
+    const delay = () => (latency ? new Promise(resolve => setTimeout(resolve, Math.random() * latency)) : null);
     return {
         data,
+        journaling,
         dropWrites: false,
         // Storage that rejects the history document while still taking the small
         // bookkeeping values: that is the shape of a quota refusal, and the case where a
         // sync must not record a cursor for rows it could not save.
         dropStateWrites: false,
-        get(key, fallback) {
-            return Promise.resolve(data.has(key) ? JSON.parse(data.get(key)) : fallback);
+        async get(key, fallback) {
+            await delay();
+            return data.has(key) ? JSON.parse(data.get(key)) : fallback;
         },
-        set(key, value) {
-            if (this.dropWrites) return Promise.resolve();
-            if (this.dropStateWrites && key === 'javstore_cleanup_state_v2') return Promise.resolve();
+        async set(key, value) {
+            await delay();
+            if (this.dropWrites) return;
+            if (this.dropStateWrites && key === 'javstore_cleanup_state_v2') return;
             data.set(key, JSON.stringify(value));
-            return Promise.resolve();
+        },
+        async list() {
+            await delay();
+            return [...data.keys()];
+        },
+        async delete(key) {
+            await delay();
+            if (this.dropWrites) return;
+            data.delete(key);
+        },
+        journals() {
+            return [...data.keys()].filter(key => key.startsWith('javstore_journal_'));
         },
         state() {
             const raw = data.get('javstore_cleanup_state_v2');
@@ -179,6 +198,10 @@ export async function openTab(store, {
     });
     window.GM_getValue = (key, fallback) => store.get(key, fallback);
     window.GM_setValue = (key, value) => store.set(key, value);
+    if (store.journaling !== false) {
+        window.GM_listValues = () => store.list();
+        window.GM_deleteValue = key => store.delete(key);
+    }
     window.GM_addStyle = () => {};
     window.confirm = () => true;
     if (remote) {

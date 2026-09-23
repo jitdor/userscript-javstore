@@ -2,7 +2,7 @@ import test, { afterEach } from 'node:test';
 import assert from 'node:assert/strict';
 import {
     makeStore, openTab, closeTabs, settle, listingHtml, detailHtml, detailWithRelatedHtml,
-    card, clickCard, pressOnCard, openInNewTabFromContextMenu, visitedUrls,
+    card, clickCard, pressOnCard, openInNewTabFromContextMenu, visitedUrls, waitFor,
 } from './harness.mjs';
 
 const CARDS = [['/a.html', 'Alpha'], ['/b.html', 'Beta'], ['/c.html', 'Gamma']];
@@ -262,4 +262,109 @@ test('a visit clobbered between the write and the read-back is replayed', async 
     assert.ok(card(reloaded.window, '/a.html').classList.contains('jvs-visited'), '/a.html came back');
     assert.ok(card(reloaded.window, '/b.html').classList.contains('jvs-visited'), '/b.html came back');
     assert.deepEqual(visitedUrls(store), clicked);
+});
+
+test('a numbered category listing with its own heading is not recorded as a visit', async () => {
+    const store = makeStore();
+    await openTab(store, {
+        html: listing().replace('<main>', '<main><h1>AV Uncensored</h1>'),
+        url: 'https://javstore.net/416-av-uncensored-page-2-cn.html',
+        referrer: 'https://javstore.net/',
+    });
+    await settle();
+    assert.deepEqual(visitedUrls(store), []);
+});
+
+// The workflow that lost visits: Ctrl-click several tiles on a listing, move on to the
+// next page and do it again. Every Ctrl-click saves from the listing and every tab it
+// opens saves again as it loads, so on a slow engine several whole-document writes are in
+// flight at once, and one built from an older read drops what another just saved.
+test('a burst of Ctrl-clicks across tabs on slow storage loses nothing', async () => {
+    const PAGE_ONE = Array.from({ length: 6 }, (_, index) => [`/one-${index}.html`, `One ${index}`]);
+    const PAGE_TWO = Array.from({ length: 6 }, (_, index) => [`/two-${index}.html`, `Two ${index}`]);
+    const clicked = [...PAGE_ONE, ...PAGE_TWO].map(([href]) => `https://javstore.net${href}`).sort();
+
+    for (let round = 0; round < 3; round += 1) {
+        const store = makeStore({ latency: 150 });
+        const session = new Map();
+        const opening = [];
+        const browse = async (tiles, url) => {
+            const listingTab = await openTab(store, { html: listingHtml(tiles), url, session });
+            for (const [href] of tiles) {
+                clickCard(listingTab.window, href);
+                opening.push(openTab(store, {
+                    html: detailWithRelatedHtml(), url: `https://javstore.net${href}`,
+                }));
+                await new Promise(resolve => setTimeout(resolve, 30));
+            }
+        };
+        await browse(PAGE_ONE, 'https://javstore.net/');
+        await browse(PAGE_TWO, 'https://javstore.net/416-av-uncensored-page-2-cn.html');
+        await Promise.all(opening);
+        await new Promise(resolve => setTimeout(resolve, 3000));
+
+        const reloaded = await openTab(store, { html: listingHtml([...PAGE_ONE, ...PAGE_TWO]) });
+        const unmarked = () => [...PAGE_ONE, ...PAGE_TWO]
+            .filter(([href]) => !card(reloaded.window, href).classList.contains('jvs-visited'))
+            .map(([href]) => href);
+        // The reload's own read takes a few slow round trips before anything is marked.
+        await waitFor(() => reloaded.window.document.querySelector('a.jvs-card')).catch(() => {});
+        await new Promise(resolve => setTimeout(resolve, 1500));
+        assert.deepEqual(unmarked(), [], `round ${round}: every Ctrl-clicked tile is marked after a reload`);
+        await waitFor(() => clicked.every(url => visitedUrls(store).includes(url)));
+        // Closing a jsdom window with a slow write still in flight crashes jsdom itself.
+        await new Promise(resolve => setTimeout(resolve, 2000));
+        closeTabs();
+    }
+});
+
+test('a visit a racing write dropped from the main document comes back from the journal', async () => {
+    const store = makeStore();
+    const tab = await openTab(store, { html: listing() });
+    const before = store.state();
+    clickCard(tab.window, '/a.html');
+    await settle();
+    assert.deepEqual(visitedUrls(store), ['https://javstore.net/a.html']);
+
+    // Another tab that read before the click writes its document back after it.
+    store.data.set('javstore_cleanup_state_v2', JSON.stringify({ ...before, updatedAt: Date.now() + 1000 }));
+    assert.deepEqual(visitedUrls(store), []);
+
+    const reloaded = await openTab(store, { html: listing() });
+    assert.ok(card(reloaded.window, '/a.html').classList.contains('jvs-visited'));
+    await waitFor(() => visitedUrls(store).length === 1);
+    assert.deepEqual(visitedUrls(store), ['https://javstore.net/a.html']);
+});
+
+test('a journal is retired once it has sat past its TTL, and not before', async () => {
+    const store = makeStore();
+    const first = await openTab(store, { html: listing() });
+    clickCard(first.window, '/a.html');
+    await settle();
+    const [firstJournal] = store.journals();
+    assert.ok(firstJournal, 'the click is journaled');
+
+    const second = await openTab(store, { html: listing() });
+    clickCard(second.window, '/b.html');
+    await settle();
+    assert.ok(store.journals().includes(firstJournal), 'a recent journal is kept');
+
+    const aged = JSON.parse(store.data.get(firstJournal));
+    aged.writtenAt -= 11 * 60000;
+    store.data.set(firstJournal, JSON.stringify(aged));
+    clickCard(second.window, '/c.html');
+    await settle();
+    assert.ok(!store.journals().includes(firstJournal), 'the aged journal is retired');
+    assert.deepEqual(visitedUrls(store), CARDS.map(([href]) => `https://javstore.net${href}`));
+});
+
+test('an engine without GM_listValues keeps history in the single document', async () => {
+    const store = makeStore({ journaling: false });
+    const tab = await openTab(store, { html: listing() });
+    clickCard(tab.window, '/a.html');
+    await settle();
+    assert.deepEqual(store.journals(), []);
+
+    const reloaded = await openTab(store, { html: listing() });
+    assert.ok(card(reloaded.window, '/a.html').classList.contains('jvs-visited'));
 });

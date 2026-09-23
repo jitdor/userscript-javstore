@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         JavStore Full Layout Cleanup - No Sidebars + Mosaic Overlay
 // @namespace    http://tampermonkey.net/
-// @version      6.4.2
+// @version      6.5.0
 // @description  Clean up JavStore's layout, filter keyword-matched thumbnails, and track visited items with private, configurable controls.
 // @homepageURL  https://github.com/jitdor/userscript-javstore
 // @supportURL   https://github.com/jitdor/userscript-javstore/issues
@@ -12,6 +12,8 @@
 // @grant        GM_addStyle
 // @grant        GM_getValue
 // @grant        GM_setValue
+// @grant        GM_listValues
+// @grant        GM_deleteValue
 // @grant        GM_addValueChangeListener
 // @grant        GM_registerMenuCommand
 // @grant        GM_xmlhttpRequest
@@ -21,11 +23,17 @@
 (function () {
     'use strict';
 
-    const SCRIPT_VERSION = '6.4.2';
+    const SCRIPT_VERSION = '6.5.0';
     const STORAGE_VERSION = 3;
     const STORAGE_KEY = 'javstore_cleanup_state_v2';
     const LEGACY_STORAGE_KEY = 'javstore_seen_links';
     const PENDING_VISITS_KEY = 'javstore_pending_visits';
+    // Each page keeps its own journal under this prefix; see "Per-page journals" below.
+    const JOURNAL_KEY_PREFIX = 'javstore_journal_v1_';
+    // How long a journal outlives the last write that could have depended on it. A
+    // read-merge-write cycle takes well under a second even on a slow engine, so this is
+    // generous; it only bounds how many stale journal keys can pile up.
+    const JOURNAL_TTL_MS = 10 * 60000;
     // The sync endpoint and its token are deliberately kept outside the synchronized
     // document: they are per-device credentials, so they neither travel to the worker nor
     // end up in an exported backup.
@@ -41,6 +49,9 @@
     const REMOTE_PAGE_ROWS = 1000;
     const MAX_SYNC_PAGES = 12;
     const NON_ITEM_PATH = /^\/(?:page|search|tag|tags|category|categories|login|logout|register|profile|user|feed|rss)(?:\/|$)/i;
+    // Category listings carry their page number in the slug, as in
+    // `/416-av-uncensored-page-2-cn.html`.
+    const LISTING_PAGE_PATH = /-page-\d+(?=[-.\/]|$)/i;
     const CARD_SELECTOR = 'main .grid a[href]';
     // A page that says it is an article says so about itself; a listing page does not.
     const ITEM_PAGE_META = 'meta[property="og:type"][content="article"], meta[property="article:published_time"]';
@@ -120,12 +131,23 @@
     // pulled back to it; `mergeStoredState` only reports it, because it also runs while
     // remote rows are being folded in, where the horizon must not move at all.
     let lastMergeBackdatedTo = 0;
+    // The oldest timestamp among the entries the last merge took on, whatever the push
+    // horizon: a merge of rows that came from outside local storage has to be carried by
+    // this page's journal back to there.
+    let lastMergeOldest = 0;
     // A local change made while a sync was writing could not arm the push timer, because
     // arming it there would have the sync push its own merge straight back. The change
     // still has to go up, so the sync re-arms it once it is done.
     let deferredRemotePush = false;
     let syncTimer = 0;
     let storageAvailable = true;
+    // This page's journal: its key, the oldest timestamp it still has to carry, and the
+    // verified saves that may later let it carry less. See "Per-page journals" below.
+    const journalKey = `${JOURNAL_KEY_PREFIX}${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 10)}`;
+    let journalSince = Date.now();
+    let journalCheckpoints = [];
+    let journalLowerings = 0;
+    let journalWritten = false;
     let observer = null;
     let ui = null;
     let selectedCard = null;
@@ -233,15 +255,248 @@
     // does mean a plain object is never mistaken for stored state; a Promise passing
     // `typeof === 'object'` unchecked previously made every reload look empty.
     async function readStoredState() {
+        return combineSnapshot(await readStorageSnapshot());
+    }
+
+    // Whether any journal carries something the main document does not: the trace a
+    // racing write leaves behind, and what the next page load puts back.
+    function journalsAhead({ main, journals }) {
+        const base = main || {};
+        const ahead = (source, target) => Object.entries(source && typeof source === 'object' ? source : {})
+            .some(([key, value]) => parseTimestamp(value) > parseTimestamp(target?.[key]));
+        // A visit the main document has since removed, cleared or pruned is not missing.
+        const visitAhead = visits => Object.entries(visits && typeof visits === 'object' ? visits : {})
+            .some(([url, value]) => {
+                const at = parseTimestamp(value);
+                return at > parseTimestamp(base.visited?.[url])
+                    && at > parseTimestamp(base.tombstones?.[tombstoneKey('v', url)])
+                    && at > parseTimestamp(base.resetAt)
+                    && at > parseTimestamp(base.prunedBefore);
+            });
+        return journals.some(({ doc }) => doc && (
+            visitAhead(doc.visited)
+            || ahead(doc.tombstones, base.tombstones)
+            || ahead(doc.overrideTimes, base.overrideTimes)
+            || parseTimestamp(doc.resetAt) > parseTimestamp(base.resetAt)
+            || parseTimestamp(doc.settingsUpdatedAt) > (main ? documentSettingsAt(base) : 0)
+        ));
+    }
+
+    async function readStorageSnapshot() {
+        let main = null;
         try {
             const state = await Promise.resolve(GM_getValue(STORAGE_KEY, null));
             storageAvailable = true;
-            if (!state || typeof state !== 'object') return null;
-            return state;
+            if (state && typeof state === 'object') main = state;
         } catch (error) {
             storageAvailable = false;
             console.warn('[JVS] Isolated storage could not be read.', error);
-            return null;
+            return { main: null, journals: [] };
+        }
+        return { main, journals: await readJournals() };
+    }
+
+    // ------------------------------------------------------------------
+    // Per-page journals
+    //
+    // The history is one stored value, and every save is a read-merge-write of all of it.
+    // Nothing makes that atomic across tabs: when a burst of Ctrl-clicks opens several
+    // tabs at once, one tab can read the document, another save a visit, and the first
+    // then write back a document without it. The merge cannot help, because the visit was
+    // never in anything the first tab read—and the check after the write passes too,
+    // because the write that clobbered it really did land.
+    //
+    // So each page also writes what it has recorded to a key of its own, which no other
+    // page ever writes. Every read folds all the journals into the main document, so a
+    // visit that a racing write dropped from the main document comes straight back on the
+    // next read by any tab, and the next save puts it back for good. A journal is removed
+    // by whichever page next saves once it has sat unchanged for JOURNAL_TTL_MS and that
+    // page's own save—which merged it—is verified in place: by then no write that could
+    // have been built without it can still be in flight.
+    //
+    // Engines without GM_listValues or GM_deleteValue cannot find or retire journals, so
+    // they keep the single-document behaviour.
+    // ------------------------------------------------------------------
+
+    function journalingAvailable() {
+        return typeof GM_listValues === 'function' && typeof GM_deleteValue === 'function';
+    }
+
+    async function readJournals() {
+        if (!journalingAvailable()) return [];
+        let keys;
+        try {
+            keys = await Promise.resolve(GM_listValues());
+        } catch (error) {
+            return [];
+        }
+        if (!Array.isArray(keys)) return [];
+        // Read side by side: on an engine where each call is a round trip, one after
+        // another would hold up every page load by the number of open journals.
+        const journals = await Promise.all(keys
+            .filter(key => typeof key === 'string' && key.startsWith(JOURNAL_KEY_PREFIX))
+            .map(async key => {
+                try {
+                    const doc = await Promise.resolve(GM_getValue(key, null));
+                    return { key, doc: doc && typeof doc === 'object' ? doc : null };
+                } catch (error) {
+                    // An unreadable journal is skipped for this read; it is retried on the next.
+                    return null;
+                }
+            }));
+        return journals.filter(Boolean);
+    }
+
+    // The settings timestamp a document carries, read the way mergeStoredState reads it.
+    function documentSettingsAt(doc) {
+        return Object.prototype.hasOwnProperty.call(doc, 'settingsUpdatedAt')
+            ? parseTimestamp(doc.settingsUpdatedAt)
+            : parseTimestamp(doc.updatedAt);
+    }
+
+    // Folds the journals into a copy of the main document, keeping the newest of each
+    // entry. Removals and horizons are only carried along, not applied: mergeStoredState
+    // does that for whoever reads the result.
+    function combineSnapshot({ main, journals }) {
+        const docs = journals.map(journal => journal.doc).filter(Boolean);
+        if (!docs.length) return main;
+        const base = main || {};
+        const combined = {
+            ...base,
+            updatedAt: parseTimestamp(base.updatedAt),
+            settingsUpdatedAt: main ? documentSettingsAt(base) : 0,
+            resetAt: parseTimestamp(base.resetAt),
+            prunedBefore: parseTimestamp(base.prunedBefore),
+            visited: { ...(base.visited && typeof base.visited === 'object' ? base.visited : {}) },
+            tombstones: { ...(base.tombstones && typeof base.tombstones === 'object' ? base.tombstones : {}) },
+            overrides: { ...(base.overrides && typeof base.overrides === 'object' ? base.overrides : {}) },
+            overrideTimes: { ...(base.overrideTimes && typeof base.overrideTimes === 'object' ? base.overrideTimes : {}) },
+        };
+        const newest = (target, source) => {
+            if (!source || typeof source !== 'object') return;
+            Object.entries(source).forEach(([key, value]) => {
+                const at = parseTimestamp(value);
+                if (at > parseTimestamp(target[key])) target[key] = at;
+            });
+        };
+        docs.forEach(doc => {
+            newest(combined.visited, doc.visited);
+            newest(combined.tombstones, doc.tombstones);
+            combined.resetAt = Math.max(combined.resetAt, parseTimestamp(doc.resetAt));
+            combined.prunedBefore = Math.max(combined.prunedBefore, parseTimestamp(doc.prunedBefore));
+            const docOverrides = doc.overrides && typeof doc.overrides === 'object' ? doc.overrides : {};
+            const docOverrideTimes = doc.overrideTimes && typeof doc.overrideTimes === 'object' ? doc.overrideTimes : {};
+            Object.entries(docOverrides).forEach(([url, value]) => {
+                const at = parseTimestamp(docOverrideTimes[url]);
+                if (at > parseTimestamp(combined.overrideTimes[url])) {
+                    combined.overrides[url] = value;
+                    combined.overrideTimes[url] = at;
+                }
+            });
+            const settingsAt = parseTimestamp(doc.settingsUpdatedAt);
+            if (doc.settings && typeof doc.settings === 'object' && settingsAt > combined.settingsUpdatedAt) {
+                combined.settings = doc.settings;
+                combined.settingsUpdatedAt = settingsAt;
+            }
+        });
+        return combined;
+    }
+
+    // Entries this page adopted with a timestamp from the past—a replayed click, rows
+    // pulled from the worker, a restored backup—exist nowhere else in local storage yet,
+    // so the journal has to reach back far enough to carry them.
+    function lowerJournalSince(at) {
+        const time = parseTimestamp(at);
+        if (!time || time >= journalSince) return;
+        journalSince = time;
+        // A checkpoint taken before this entry arrived says nothing about it, and neither
+        // does one from a save that was already under way.
+        journalCheckpoints = [];
+        journalLowerings += 1;
+    }
+
+    // Once a save that covered everything up to some moment has been verified in place for
+    // longer than JOURNAL_TTL_MS, the journal no longer needs to reach back past it.
+    function advanceJournalSince(now) {
+        while (journalCheckpoints.length && now - journalCheckpoints[0].verifiedAt > JOURNAL_TTL_MS) {
+            const { covers } = journalCheckpoints.shift();
+            if (covers >= journalSince) journalSince = covers + 1;
+        }
+    }
+
+    function serializeJournal(writtenAt) {
+        const pick = source => {
+            const result = {};
+            for (const [key, at] of source) {
+                if (at >= journalSince) result[key] = at;
+            }
+            return result;
+        };
+        const journalOverrides = {};
+        const journalOverrideTimes = {};
+        for (const [url, value] of overrides) {
+            const at = overrideTimes.get(url) || 0;
+            if (at >= journalSince) {
+                journalOverrides[url] = value;
+                journalOverrideTimes[url] = at;
+            }
+        }
+        const journal = {
+            version: STORAGE_VERSION,
+            writtenAt,
+            resetAt,
+            prunedBefore,
+            visited: pick(visited),
+            tombstones: pick(tombstones),
+            overrides: journalOverrides,
+            overrideTimes: journalOverrideTimes,
+        };
+        // Settings are one small object, so they always ride along rather than being
+        // tracked by where they came from; the newest copy wins when journals are folded.
+        if (settingsUpdatedAt) {
+            journal.settings = { ...settings };
+            journal.settingsUpdatedAt = settingsUpdatedAt;
+        }
+        return journal;
+    }
+
+    async function writeJournal(writtenAt) {
+        if (!journalingAvailable()) return;
+        advanceJournalSince(writtenAt);
+        const journal = serializeJournal(writtenAt);
+        const carries = Object.keys(journal.visited).length
+            || Object.keys(journal.tombstones).length
+            || Object.keys(journal.overrides).length
+            || resetAt >= journalSince
+            || settingsUpdatedAt >= journalSince;
+        if (carries) {
+            await Promise.resolve(GM_setValue(journalKey, journal));
+            journalWritten = true;
+        } else if (journalWritten) {
+            // Everything it held has been safely in the main document for a TTL.
+            await Promise.resolve(GM_deleteValue(journalKey));
+            journalWritten = false;
+        }
+    }
+
+    // Called after this page's save is verified in place: that save merged every journal
+    // in `snapshot`, so any of them that has sat unchanged past the TTL is no longer the
+    // only copy of anything a racing write could still drop.
+    async function retireJournals(snapshot, now) {
+        if (!journalingAvailable()) return;
+        for (const { key, doc } of snapshot.journals) {
+            if (key === journalKey) continue;
+            const writtenAt = parseTimestamp(doc?.writtenAt);
+            if (doc && now - writtenAt <= JOURNAL_TTL_MS) continue;
+            try {
+                // Its page may have written to it since this save read it; if so it is
+                // left for a later save to merge.
+                const current = await Promise.resolve(GM_getValue(key, null));
+                if (current && parseTimestamp(current.writtenAt) !== writtenAt) continue;
+                await Promise.resolve(GM_deleteValue(key));
+            } catch (error) {
+                // Left in place; the next save tries again.
+            }
         }
     }
 
@@ -289,12 +544,14 @@
     function mergeStoredState(stored, { adoptSettings = false } = {}) {
         lastMergeAdopted = false;
         lastMergeBackdatedTo = 0;
+        lastMergeOldest = 0;
         if (!stored || typeof stored !== 'object') return false;
 
         // An entry is "backdated" when it is stamped before this device's push horizon:
         // it was recorded somewhere this device had not looked—another tab, a replayed
         // click, a restored backup—so the horizon has already swept past it.
         const backdated = at => {
+            if (at) lastMergeOldest = lastMergeOldest ? Math.min(lastMergeOldest, at) : at;
             if (!at || !pushHorizon() || at >= pushHorizon()) return;
             lastMergeBackdatedTo = lastMergeBackdatedTo ? Math.min(lastMergeBackdatedTo, at) : at;
         };
@@ -421,10 +678,15 @@
         const startedAt = Date.now();
         for (let attempt = 0; attempt < 2; attempt += 1) {
             try {
-                mergeStoredState(await readStoredState());
+                const lowerings = journalLowerings;
+                const snapshot = await readStorageSnapshot();
+                mergeStoredState(combineSnapshot(snapshot));
                 notePushBacklog();
                 pruneVisited();
                 const payload = serializeState();
+                // The journal goes first: if the page unloads between the two writes, the
+                // journal is the copy that no other tab can overwrite.
+                await writeJournal(payload.updatedAt);
                 await Promise.resolve(GM_setValue(STORAGE_KEY, payload));
                 // Read back rather than trusting the write: a value that never landed is
                 // exactly the failure that used to go unnoticed until the history was gone.
@@ -438,6 +700,11 @@
                 lastSaveFailed = false;
                 storageAvailable = true;
                 clearPendingVisits(startedAt, verified);
+                // Only a save still in place when read back vouches for what it merged.
+                if (parseTimestamp(verified.updatedAt) === payload.updatedAt) {
+                    if (lowerings === journalLowerings) journalCheckpoints.push({ verifiedAt: Date.now(), covers: payload.updatedAt });
+                    await retireJournals(snapshot, Date.now());
+                }
                 scheduleCountUpdate();
                 return true;
             } catch (error) {
@@ -542,6 +809,7 @@
             // The click happened before this page loaded, and possibly before the last
             // push: without pulling the horizon back it would never be offered upstream.
             lowerPushHorizon(at);
+            lowerJournalSince(at);
             changed = true;
         });
         return changed;
@@ -574,6 +842,7 @@
     // cards is an item page when it also carries content those cards do not account for.
     function isItemPage() {
         if (location.pathname === '/' || NON_ITEM_PATH.test(location.pathname)) return false;
+        if (LISTING_PAGE_PATH.test(location.pathname)) return false;
         if (document.querySelector(ITEM_PAGE_META)) return true;
         const cards = collectCards(document);
         if (!cards.length) return true;
@@ -989,6 +1258,7 @@
                     const document = echoed?.state && typeof echoed.state === 'object' ? echoed.state : answer.state;
                     if (applyStoredState(document)) changed = true;
                     if (lastMergeAdopted) absorbed = true;
+                    lowerJournalSince(lastMergeOldest);
                     break;
                 }
 
@@ -997,6 +1267,8 @@
                 cursor = Math.max(0, Number(answer.cursor) || 0);
                 applyingRemoteState = true;
                 if (applyStoredState(documentFromRows(answer.changes, answer.meta))) changed = true;
+                // Pulled rows exist nowhere else on this device until they are saved.
+                lowerJournalSince(lastMergeOldest);
                 // A batch can carry nothing but protective metadata—a tombstone, a newer
                 // `resetAt`, `prunedBefore` or `settingsUpdatedAt`—which removes nothing on
                 // screen and so leaves `changed` false. It still has to be saved: the cursor
@@ -1772,6 +2044,7 @@
             const oldest = [...visited.values(), ...overrideTimes.values()]
                 .reduce((least, at) => (least ? Math.min(least, at) : at), 0);
             lowerPushHorizon(oldest);
+            lowerJournalSince(oldest);
             persistState();
             setRootState();
             processAllCards();
@@ -2130,7 +2403,8 @@
 
     async function boot() {
         syncConfig = await readSyncConfig();
-        const initialState = await readStoredState();
+        const snapshot = await readStorageSnapshot();
+        const initialState = combineSnapshot(snapshot);
         settings = sanitizeSettings(initialState?.settings);
         visited = parseVisited(initialState?.visited);
         overrides = parseOverrides(initialState?.overrides);
@@ -2143,7 +2417,7 @@
         const replayed = replayPendingVisits();
         pruneVisited();
         await migrateLegacyHistory();
-        if (replayed) persistState();
+        if (replayed || journalsAhead(snapshot)) persistState();
         setRootState();
 
         if (document.readyState === 'loading') {

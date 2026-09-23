@@ -1,5 +1,11 @@
 # Changelog
 
+## 6.5.0
+
+- Fix: visits could vanish when several tabs saved at the same moment, which is exactly what Ctrl-clicking a row of tiles does: each click saves from the listing and each tab it opens saves again as it loads. Every save reads the whole history, merges, and writes the whole history back, and nothing makes that atomic across tabs, so a slow save built from an older read wrote back a document without a visit another tab had just stored. The merge could not catch it (the visit was never in what that tab read), and neither could the read-back check (the clobbering write really had landed). On a slow storage engine such as AdGuard's this happened often enough to leave gaps in the history, so the tiles already seen were not marked when the listing was reloaded.
+- Change: each page now also writes what it records to a journal key of its own, which no other page writes. Every read folds all journals into the main document, so a visit a racing save dropped comes back on the next read, and the next save puts it back for good; a page load that finds a journal ahead of the main document saves straight away. A journal is removed once it has sat unchanged for ten minutes and a save that merged it has been read back in place. This needs `GM_listValues` and `GM_deleteValue`, which the script now requests; an engine without them keeps the single-document behaviour.
+- Fix: a numbered category listing such as `/416-av-uncensored-page-2-cn.html` is no longer taken for an item page and recorded as a visit when it carries a heading of its own.
+
 ## 6.4.2
 
 - Fix: a visit could be lost when a sibling tab's stale document landed between this tab's write and the read-back that checks it. The read-back then carries a newer timestamp, so the write looks good, while the visit it was meant to save has been clobbered out of it — and the replay note, the only copy left, was given up on that report. The note is now kept until the document that comes back from storage actually carries the click. This costs the visit outright when the tab does not navigate: an ordinary click replays the note on the page it opens, but Cmd-clicking a tile leaves the listing where it is, so a refresh is the next thing to read storage.
