@@ -1018,6 +1018,29 @@ test('a sync link pasted into the endpoint box sets everything up', async () => 
     assert.equal(form.elements.syncToken.value, '', 'the token is not written back into the page');
 });
 
+test('a sync link pasted on an engine with only the dotted GM API is saved and survives a reload', async () => {
+    const remote = makeRemote();
+    const first = await openDevice(remote);
+    const link = await copyLink(first);
+
+    const store = makeStore({ dottedOnly: true });
+    const tab = await openTab(store, { html: listing(), remote });
+    const form = tab.shadow().querySelector('form.sync-form');
+    form.elements.syncEndpoint.value = link;
+    form.dispatchEvent(new tab.window.Event('submit', { bubbles: true, cancelable: true }));
+    await settle();
+
+    const saved = store.read('javstore_sync_config_v1');
+    assert.equal(saved.enabled, true);
+    assert.equal(saved.endpoint, remote.endpoint);
+    assert.equal(saved.token, remote.token);
+
+    const reloaded = await openTab(store, { html: listing(), remote });
+    const again = reloaded.shadow().querySelector('form.sync-form');
+    assert.equal(again.elements.syncEnabled.checked, true);
+    assert.equal(again.elements.syncEndpoint.value, remote.endpoint);
+});
+
 test('a mangled sync link changes nothing', async () => {
     const store = makeStore();
     const tab = await openTab(store, { html: listing(), url: 'https://javstore.net/#jvs-sync=not-a-real-link' });

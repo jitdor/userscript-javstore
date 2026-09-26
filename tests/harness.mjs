@@ -24,12 +24,16 @@ const openWindows = new Set();
 // survives a reload). `primitivesOnly` is AdGuard for Android, which keeps only what the
 // GM4 API promises to—strings, numbers, booleans—so an object comes back after a reload as
 // "[object Object]". `read` and `write` see through the script's own encoding.
-export function makeStore({ latency = 0, journaling = true, primitivesOnly = false } = {}) {
+//
+// `dottedOnly` is the Userscripts app for Safari, which provides only the dotted GM4 API
+// (GM.getValue, GM.setValue, ...) and no GM_* functions at all.
+export function makeStore({ latency = 0, journaling = true, primitivesOnly = false, dottedOnly = false } = {}) {
     const data = new Map();
     const delay = () => (latency ? new Promise(resolve => setTimeout(resolve, Math.random() * latency)) : null);
     return {
         data,
         journaling,
+        dottedOnly,
         dropWrites: false,
         // Storage that rejects the history document while still taking the small
         // bookkeeping values: that is the shape of a quota refusal, and the case where a
@@ -210,13 +214,25 @@ export async function openTab(store, {
             removeItem: key => session.delete(key),
         },
     });
-    window.GM_getValue = (key, fallback) => store.get(key, fallback);
-    window.GM_setValue = (key, value) => store.set(key, value);
-    if (store.journaling !== false) {
-        window.GM_listValues = () => store.list();
-        window.GM_deleteValue = key => store.delete(key);
+    if (store.dottedOnly) {
+        window.GM = {
+            getValue: (key, fallback) => store.get(key, fallback),
+            setValue: (key, value) => store.set(key, value),
+            addStyle: async () => {},
+        };
+        if (store.journaling !== false) {
+            window.GM.listValues = () => store.list();
+            window.GM.deleteValue = key => store.delete(key);
+        }
+    } else {
+        window.GM_getValue = (key, fallback) => store.get(key, fallback);
+        window.GM_setValue = (key, value) => store.set(key, value);
+        if (store.journaling !== false) {
+            window.GM_listValues = () => store.list();
+            window.GM_deleteValue = key => store.delete(key);
+        }
+        window.GM_addStyle = () => {};
     }
-    window.GM_addStyle = () => {};
     window.confirm = confirm;
     if (remote) {
         // A tab may be able to reach more than one worker (the panel can be repointed at a
