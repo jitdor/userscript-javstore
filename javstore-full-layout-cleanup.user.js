@@ -1631,7 +1631,7 @@
     }
 
     function describeWorkerBehind() {
-        return `Your sync worker is ${remoteWorkerVersion}, behind this script (${SCRIPT_VERSION}). Redeploy it: run npx wrangler deploy in the repository's worker/ folder.`;
+        return `Your sync worker is ${remoteWorkerVersion}, behind this script (${SCRIPT_VERSION}). The worker redeploys from main through Cloudflare, so check its latest build in the Cloudflare dashboard.`;
     }
 
     // The worker deploys from the same commit the release is cut from, so a worker ahead of

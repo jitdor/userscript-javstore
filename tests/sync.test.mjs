@@ -908,7 +908,7 @@ test('an older worker is named from its answer and flagged for redeploying', asy
         await settle();
         const toast = tab.shadow().querySelector('.toast');
         assert.match(toast.textContent, new RegExp(`^Your sync worker is ${expected}, behind this script`));
-        assert.match(toast.textContent, /npx wrangler deploy/);
+        assert.match(toast.textContent, /Cloudflare/);
         closeTabs();
     }
 });

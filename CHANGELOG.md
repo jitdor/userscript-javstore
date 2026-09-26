@@ -2,8 +2,7 @@
 
 ## 6.9.0
 
-- Change: a worker behind the userscript is now flagged on the page itself with a **⚠ Redeploy worker** button next to the JavStore controls, instead of only in the Cloud sync panel, where it was easy to miss. Tapping it shows both versions and the deploy command. The panel still lists the worker version.
-- Note: nothing in this repository deploys the worker. Releases publish only the userscript, so the worker stays on whatever version was last deployed by hand until you run `npx wrangler deploy` in `worker/`.
+- Change: a worker behind the userscript is now flagged on the page itself with a **⚠ Redeploy worker** button next to the JavStore controls, instead of only in the Cloud sync panel, where it was easy to miss. Tapping it shows both versions and points to the worker's Cloudflare build. The panel still lists the worker version.
 
 ## 6.8.1
 
