@@ -899,8 +899,16 @@ test('an older worker is named from its answer and flagged for redeploying', asy
         };
         const tab = await openDevice(remote);
         await syncNow(tab);
-        assert.match(workerVersionText(tab).textContent, new RegExp(`^Worker version: ${expected}, behind this script`));
-        assert.match(workerVersionText(tab).textContent, /Redeploy the worker/);
+        assert.equal(workerVersionText(tab).textContent, `Worker version: ${expected}.`);
+        // The warning sits on the page, not inside the settings panel.
+        const pill = tab.shadow().querySelector('.dock .redeploy');
+        assert.equal(pill.hidden, false);
+        assert.equal(tab.shadow().querySelector('.panel').hidden, true);
+        pill.click();
+        await settle();
+        const toast = tab.shadow().querySelector('.toast');
+        assert.match(toast.textContent, new RegExp(`^Your sync worker is ${expected}, behind this script`));
+        assert.match(toast.textContent, /npx wrangler deploy/);
         closeTabs();
     }
 });
@@ -943,6 +951,21 @@ test('a script level with or ahead of its worker shows no update warning', async
         await syncNow(tab);
         assert.equal(tab.shadow().querySelector('.update').hidden, true, `worker ${reported}`);
         assert.equal(tab.shadow().querySelector('.update-warning').hidden, true, `worker ${reported}`);
+        closeTabs();
+    }
+});
+
+test('a worker level with or ahead of the script shows no redeploy warning', async () => {
+    for (const reported of [WORKER_VERSION, '99.0.0']) {
+        const remote = makeRemote();
+        const reach = remote.handle;
+        remote.handle = async request => {
+            const response = await reach(request);
+            return { ...response, text: JSON.stringify({ ...JSON.parse(response.text), worker: reported }) };
+        };
+        const tab = await openDevice(remote);
+        await syncNow(tab);
+        assert.equal(tab.shadow().querySelector('.redeploy').hidden, true, `worker ${reported}`);
         closeTabs();
     }
 });

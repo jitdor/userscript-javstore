@@ -17,7 +17,7 @@
 const STORAGE_VERSION = 3;
 // Reported in every answer so the userscript can show which worker it is talking to. It
 // moves in step with the userscript's own version; a test holds the two together.
-export const WORKER_VERSION = '6.8.1';
+export const WORKER_VERSION = '6.9.0';
 const OBJECT_NAME = 'default';
 const MAX_BODY_BYTES = 8 * 1024 * 1024;
 const MAX_PAGE_ROWS = 2000;
