@@ -15,6 +15,9 @@
 // — the same rule the userscript applies locally, so both sides converge on the same state.
 
 const STORAGE_VERSION = 3;
+// Reported in every answer so the userscript can show which worker it is talking to. It
+// moves in step with the userscript's own version; a test holds the two together.
+export const WORKER_VERSION = '6.7.0';
 const OBJECT_NAME = 'default';
 const MAX_BODY_BYTES = 8 * 1024 * 1024;
 const MAX_PAGE_ROWS = 2000;
@@ -268,6 +271,7 @@ export class SyncStore {
         if (incoming.length) this.#prune(now);
 
         return {
+            worker: WORKER_VERSION,
             cursor: more ? changes[limit - 1].seq : timestamp(this.#meta('seq', 0)),
             more,
             meta: this.#readMeta(),
@@ -363,7 +367,7 @@ export class SyncStore {
         await this.#importLegacyStore();
 
         if (request.method === 'GET') {
-            return Response.json({ state: this.document() });
+            return Response.json({ worker: WORKER_VERSION, state: this.document() });
         }
         if (request.method !== 'POST') {
             return Response.json({ error: 'Use GET to read or POST to sync.' }, { status: 405 });
@@ -385,7 +389,7 @@ export class SyncStore {
 
         if (body.state && typeof body.state === 'object') {
             this.applyDocument(body.state);
-            return Response.json({ state: this.document() });
+            return Response.json({ worker: WORKER_VERSION, state: this.document() });
         }
         return Response.json(this.sync(body));
     }

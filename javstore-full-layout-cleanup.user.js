@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         JavStore Full Layout Cleanup - No Sidebars + Mosaic Overlay
 // @namespace    http://tampermonkey.net/
-// @version      6.6.0
+// @version      6.7.0
 // @description  Clean up JavStore's layout, filter keyword-matched thumbnails, and track visited items with private, configurable controls.
 // @homepageURL  https://github.com/jitdor/userscript-javstore
 // @supportURL   https://github.com/jitdor/userscript-javstore/issues
@@ -23,7 +23,7 @@
 (function () {
     'use strict';
 
-    const SCRIPT_VERSION = '6.6.0';
+    const SCRIPT_VERSION = '6.7.0';
     const STORAGE_VERSION = 3;
     const STORAGE_KEY = 'javstore_cleanup_state_v2';
     const LEGACY_STORAGE_KEY = 'javstore_seen_links';
@@ -122,6 +122,9 @@
     let remotePollTimer = 0;
     let lastRemoteAttemptAt = 0;
     let lastRemoteSyncAt = 0;
+    // What the worker said it is on the last answer this page got, or what its answer's
+    // shape gives away when it is too old to say.
+    let remoteWorkerVersion = '';
     let lastRemoteError = '';
     let remoteSyncRunning = false;
     let applyingRemoteState = false;
@@ -1332,6 +1335,7 @@
                 if (!answer || typeof answer !== 'object') {
                     throw new Error('the worker returned nothing');
                 }
+                remoteWorkerVersion = workerVersionFrom(answer);
                 // A worker still running the document-only version answers with a whole
                 // document and no cursor. Fall back to that exchange rather than silently
                 // pulling from it without ever pushing.
@@ -1442,6 +1446,34 @@
         remotePollTimer = 0;
         if (!syncConfigured()) return;
         remotePollTimer = window.setInterval(() => queueSync(), syncConfig.intervalMinutes * 60000);
+    }
+
+    // Workers from 6.7.0 on name their version. Older ones are told apart by what they send:
+    // 6.6.0 added per-setting stamps to the metadata, and before 6.3.0 there was no cursor.
+    function workerVersionFrom(answer) {
+        if (typeof answer?.worker === 'string' && answer.worker) return answer.worker.slice(0, 40);
+        if (answer?.cursor === undefined) return 'older than 6.3.0';
+        if (answer.meta && typeof answer.meta === 'object' && 'settingTimes' in answer.meta) return '6.6.0';
+        return 'older than 6.6.0';
+    }
+
+    function compareVersions(left, right) {
+        const parts = value => String(value).split('.').map(part => Number.parseInt(part, 10) || 0);
+        const [a, b] = [parts(left), parts(right)];
+        for (let index = 0; index < Math.max(a.length, b.length); index += 1) {
+            if ((a[index] || 0) !== (b[index] || 0)) return (a[index] || 0) - (b[index] || 0);
+        }
+        return 0;
+    }
+
+    function describeWorkerVersion() {
+        if (!syncConfigured()) return '';
+        if (!remoteWorkerVersion) return 'Worker version: not known until the first sync on this page.';
+        const known = /^\d+(\.\d+)*$/.test(remoteWorkerVersion);
+        const behind = !known || compareVersions(remoteWorkerVersion, SCRIPT_VERSION) < 0;
+        return behind
+            ? `Worker version: ${remoteWorkerVersion}, behind this script (${SCRIPT_VERSION}). Redeploy the worker.`
+            : `Worker version: ${remoteWorkerVersion}.`;
     }
 
     function describeSyncState() {
@@ -1931,6 +1963,9 @@
         const capped = counts.stored >= MAX_VISITED_ITEMS ? ' (cap reached—oldest are dropped)' : '';
         ui.summary.textContent = `${counts.matched} matched · ${counts.visited} visited`;
         ui.counts.textContent = `${counts.total} cards on this page · ${counts.stored} visited URLs stored${capped} · ${describeSaveState()} · ${describeSyncState()}`;
+        const workerVersion = describeWorkerVersion();
+        ui.workerVersion.textContent = workerVersion;
+        ui.workerVersion.hidden = !workerVersion;
     }
 
     function showToast(message, isError = false) {
@@ -2291,6 +2326,7 @@
                     </div>
                     <div class="actions"><button class="primary save-sync" type="submit">Save sync settings</button><button class="sync-now" type="button">Sync now</button></div>
                 </form>
+                <p class="muted worker-version" hidden></p>
                 <h3>Data</h3>
                 <div class="actions">
                     <button class="export" type="button">Export backup</button>
@@ -2311,6 +2347,7 @@
         ui = {
             host, shadow, panel, summary, liftButton, form, syncForm, selectedActions,
             counts: shadow.querySelector('.counts'),
+            workerVersion: shadow.querySelector('.worker-version'),
             storageWarning: shadow.querySelector('.storage-warning'),
             selectedTitle: shadow.querySelector('.selected-title'),
             overrideButton: shadow.querySelector('.card-override'),

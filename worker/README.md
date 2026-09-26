@@ -77,10 +77,13 @@ Every route requires `Authorization: Bearer <SYNC_TOKEN>`; the path is ignored.
 
 | Method | Body | Answer |
 | --- | --- | --- |
-| `GET` | — | `{ "state": <whole document> }`, for backups |
-| `POST` | `{ cursor, meta, changes[], limit? }` | `{ cursor, more, meta, changes[] }` |
-| `POST` | `{ "state": <document> }` (6.2.0 clients) | `{ "state": <whole document> }` |
+| `GET` | — | `{ worker, "state": <whole document> }`, for backups |
+| `POST` | `{ cursor, meta, changes[], limit? }` | `{ worker, cursor, more, meta, changes[] }` |
+| `POST` | `{ "state": <document> }` (6.2.0 clients) | `{ worker, "state": <whole document> }` |
 | `OPTIONS` | — | CORS preflight |
+
+`worker` is the worker's version (from 6.7.0). The userscript shows it in the Cloud sync
+panel and flags a worker that is behind it.
 
 A delta `POST` hands over the entries the device has touched since its last push and asks
 for everything recorded after `cursor`. Entries are last-writer-wins on their own event

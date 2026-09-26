@@ -1,5 +1,10 @@
 # Changelog
 
+## 6.7.0
+
+- Add: the Cloud sync panel shows which worker version the device is syncing with, taken from the worker's own answers. If the worker is behind the userscript, the line says so and asks you to redeploy it. Workers from 6.7.0 on send their version in every answer. Older workers are recognised from the shape of their answer: `6.6.0`, "older than 6.6.0", or "older than 6.3.0".
+- Change: the worker's version now moves in step with the userscript's, and a test enforces it, because both deploy from the same commit.
+
 ## 6.6.0
 
 - Fix: on AdGuard for Android, every refresh turned cloud sync off and wiped the history on that device. Setting sync up again pulled everything back and showed it, but the next refresh lost it all again. The script stored its history and sync settings as plain objects, but the GM4 API only promises to keep strings, numbers and booleans. AdGuard for Android sticks to that: while the page stays open it hands the object back, so the check after each save passed, but after a reload the key reads as empty. Every value is now stored as a JSON string and decoded when read. Values an older version stored as objects still load and are rewritten in the new form on the next save. What was already lost on such an engine cannot be recovered, but turning sync on again pulls the worker's copy back.

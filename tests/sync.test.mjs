@@ -1,6 +1,7 @@
 import test, { afterEach } from 'node:test';
 import assert from 'node:assert/strict';
-import worker from '../worker/src/worker.mjs';
+import worker, { WORKER_VERSION } from '../worker/src/worker.mjs';
+import fs from 'node:fs';
 import {
     makeStore, makeRemote, enableSync, openTab, closeTabs, settle, waitFor,
     listingHtml, card, clickCard, pressOnCard, visitedUrls,
@@ -854,4 +855,49 @@ test('a manual sync reports what went up, not only what came down', async () => 
 
     await syncNow(tab);
     assert.match(tab.shadow().querySelector('.toast').textContent, /Nothing new either way/);
+});
+
+const workerVersionText = tab => tab.shadow().querySelector('.worker-version');
+
+// The worker deploys from the same commit as the script, so the two versions move together.
+test('the worker reports the same version as the userscript', () => {
+    const source = fs.readFileSync(new URL('../javstore-full-layout-cleanup.user.js', import.meta.url), 'utf8');
+    const declared = /^\/\/ @version\s+(\S+)/m.exec(source)[1];
+    assert.equal(WORKER_VERSION, declared);
+});
+
+test('the panel shows the version the worker reports', async () => {
+    const remote = makeRemote();
+    const tab = await openDevice(remote);
+    await syncNow(tab);
+    const line = workerVersionText(tab);
+    assert.equal(line.hidden, false);
+    assert.equal(line.textContent, `Worker version: ${WORKER_VERSION}.`);
+});
+
+test('the panel is quiet about the worker until sync is on', async () => {
+    const tab = await openTab(makeStore(), { html: listing() });
+    assert.equal(workerVersionText(tab).hidden, true);
+});
+
+// Workers from before the version field are recognised by the shape of their answer.
+test('an older worker is named from its answer and flagged for redeploying', async () => {
+    for (const [strip, expected] of [
+        [meta => meta, '6.6.0'],
+        [({ settingTimes, ...meta }) => meta, 'older than 6.6.0'],
+    ]) {
+        const remote = makeRemote();
+        const reach = remote.handle;
+        remote.handle = async request => {
+            const response = await reach(request);
+            const { worker: _version, ...answer } = JSON.parse(response.text);
+            if (answer.meta) answer.meta = strip(answer.meta);
+            return { ...response, text: JSON.stringify(answer) };
+        };
+        const tab = await openDevice(remote);
+        await syncNow(tab);
+        assert.match(workerVersionText(tab).textContent, new RegExp(`^Worker version: ${expected}, behind this script`));
+        assert.match(workerVersionText(tab).textContent, /Redeploy the worker/);
+        closeTabs();
+    }
 });
