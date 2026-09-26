@@ -1,5 +1,9 @@
 # Changelog
 
+## 6.9.0
+
+- Change: a worker behind the userscript is now flagged on the page itself with a **⚠ Redeploy worker** button next to the JavStore controls, instead of only in the Cloud sync panel, where it was easy to miss. Tapping it shows both versions and points to the worker's Cloudflare build. The panel still lists the worker version.
+
 ## 6.8.1
 
 - Fix: on the Userscripts app for Safari (iPhone, iPad and Mac), nothing was ever saved. Pasting a sync link, or saving the sync settings by hand, showed "Sync settings could not be saved", and visited history was gone after every reload. That app offers only the dotted GM4 API (`GM.getValue`, `GM.setValue`, …) and no `GM_*` functions, so every storage call failed. The script now uses whichever of the two forms the userscript manager provides, and requests the `GM.*` grants too. After updating, paste the sync link again and save.

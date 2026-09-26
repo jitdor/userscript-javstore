@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         JavStore Full Layout Cleanup - No Sidebars + Mosaic Overlay
 // @namespace    http://tampermonkey.net/
-// @version      6.8.1
+// @version      6.9.0
 // @description  Clean up JavStore's layout, filter keyword-matched thumbnails, and track visited items with private, configurable controls.
 // @homepageURL  https://github.com/jitdor/userscript-javstore
 // @supportURL   https://github.com/jitdor/userscript-javstore/issues
@@ -29,7 +29,7 @@
 (function () {
     'use strict';
 
-    const SCRIPT_VERSION = '6.8.1';
+    const SCRIPT_VERSION = '6.9.0';
     // The same address as @downloadURL: opening it hands the newest release to the
     // userscript manager, which offers to install it.
     const INSTALL_URL = 'https://github.com/jitdor/userscript-javstore/releases/latest/download/javstore-full-layout-cleanup.user.js';
@@ -1617,14 +1617,21 @@
         return 0;
     }
 
+    // A worker that only says it is "older than" some version is behind by definition.
+    function workerBehindScript() {
+        if (!syncConfigured() || !remoteWorkerVersion) return false;
+        return !/^\d+(\.\d+)*$/.test(remoteWorkerVersion)
+            || compareVersions(remoteWorkerVersion, SCRIPT_VERSION) < 0;
+    }
+
     function describeWorkerVersion() {
         if (!syncConfigured()) return '';
         if (!remoteWorkerVersion) return 'Worker version: not known until the first sync on this page.';
-        const known = /^\d+(\.\d+)*$/.test(remoteWorkerVersion);
-        const behind = !known || compareVersions(remoteWorkerVersion, SCRIPT_VERSION) < 0;
-        return behind
-            ? `Worker version: ${remoteWorkerVersion}, behind this script (${SCRIPT_VERSION}). Redeploy the worker.`
-            : `Worker version: ${remoteWorkerVersion}.`;
+        return `Worker version: ${remoteWorkerVersion}.`;
+    }
+
+    function describeWorkerBehind() {
+        return `Your sync worker is ${remoteWorkerVersion}, behind this script (${SCRIPT_VERSION}). The worker redeploys from main through Cloudflare, so check its latest build in the Cloudflare dashboard.`;
     }
 
     // The worker deploys from the same commit the release is cut from, so a worker ahead of
@@ -2126,6 +2133,9 @@
         const workerVersion = describeWorkerVersion();
         ui.workerVersion.textContent = workerVersion;
         ui.workerVersion.hidden = !workerVersion;
+        const workerBehind = workerBehindScript();
+        ui.redeployButton.hidden = !workerBehind;
+        if (workerBehind) ui.redeployButton.title = describeWorkerBehind();
         const behind = scriptBehindWorker();
         ui.updateButton.hidden = !behind;
         ui.updateWarning.hidden = !behind;
@@ -2143,7 +2153,7 @@
         ui.toast.classList.toggle('error', isError);
         ui.toast.classList.add('show');
         window.clearTimeout(ui.toastTimer);
-        ui.toastTimer = window.setTimeout(() => ui?.toast.classList.remove('show'), 2800);
+        ui.toastTimer = window.setTimeout(() => ui?.toast.classList.remove('show'), Math.max(2800, message.length * 60));
     }
 
     function splitTerms(value) {
@@ -2394,8 +2404,8 @@
                 .muted { color: #9ca3af; font-size: 12px; }
                 .warning { padding: 8px; border-radius: 8px; color: #fecaca; background: #7f1d1d; }
                 .warning a { color: #fff; }
-                .pill.update { border-color: #fca5a5; background: #991b1b; }
-                .pill.update:hover { background: #7f1d1d; }
+                .pill.update, .pill.redeploy { border-color: #fca5a5; background: #991b1b; }
+                .pill.update:hover, .pill.redeploy:hover { background: #7f1d1d; }
                 .pill[hidden], .warning[hidden] { display: none; }
                 .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
                 .full { grid-column: 1 / -1; }
@@ -2435,6 +2445,7 @@
             </style>
             <div class="dock" aria-label="JavStore cleanup controls">
                 <button class="pill update" type="button" hidden>⚠ Update script</button>
+                <button class="pill redeploy" type="button" hidden>⚠ Redeploy worker</button>
                 <button class="pill lift" type="button">Reveal all</button>
                 <button class="pill summary" type="button" aria-expanded="false">JavStore controls</button>
             </div>
@@ -2523,6 +2534,7 @@
             workerVersion: shadow.querySelector('.worker-version'),
             storageWarning: shadow.querySelector('.storage-warning'),
             updateButton: shadow.querySelector('.update'),
+            redeployButton: shadow.querySelector('.redeploy'),
             updateWarning: shadow.querySelector('.update-warning'),
             updateVersions: shadow.querySelector('.update-versions'),
             selectedTitle: shadow.querySelector('.selected-title'),
@@ -2546,6 +2558,7 @@
         shadow.querySelector('.close').addEventListener('click', () => setPanelOpen(false));
         liftButton.addEventListener('click', toggleOverlays);
         shadow.querySelector('.update').addEventListener('click', () => setPanelOpen(true));
+        shadow.querySelector('.redeploy').addEventListener('click', () => showToast(describeWorkerBehind(), true));
         form.addEventListener('submit', event => {
             event.preventDefault();
             applySettings(readSettingsForm());
