@@ -946,3 +946,82 @@ test('a script level with or ahead of its worker shows no update warning', async
         closeTabs();
     }
 });
+
+// AdGuard for Android clears a userscript's storage when it installs an update, so the panel
+// hands out one link that sets sync up again.
+async function copyLink(tab) {
+    let copied = null;
+    tab.window.prompt = (_message, value) => { copied = value; return null; };
+    tab.shadow().querySelector('.copy-sync-link').click();
+    await settle();
+    return copied;
+}
+
+test('a sync link sets up a wiped device again when it is opened', async () => {
+    const remote = makeRemote();
+    const first = await openDevice(remote);
+    clickCard(first.window, '/a.html');
+    await settle();
+    await syncNow(first);
+    const link = await copyLink(first);
+    assert.match(link, /^https:\/\/javstore\.net\/#jvs-sync=[A-Za-z0-9_-]+$/);
+    assert.ok(!link.includes(remote.token), 'the token is not sitting in the link as plain text');
+
+    // The same device after the manager's update wiped its storage.
+    const wiped = makeStore();
+    let asked = '';
+    const tab = await openTab(wiped, {
+        html: listing(),
+        url: link,
+        remote,
+        confirm: message => { asked = message; return true; },
+    });
+    await settle();
+    assert.match(asked, /sync\.test/, 'the prompt names the worker it will send history to');
+    assert.equal(tab.window.location.hash, '', 'the token is taken off the address bar');
+    assert.equal(wiped.read('javstore_sync_config_v1').token, remote.token);
+    assert.equal(tab.shadow().querySelector('form.sync-form').elements.syncEnabled.checked, true);
+    await waitFor(() => card(tab.window, '/a.html').classList.contains('jvs-visited'));
+});
+
+test('a sync link is not used without saying yes', async () => {
+    const remote = makeRemote();
+    const first = await openDevice(remote);
+    const link = await copyLink(first);
+
+    const before = remote.requests.length;
+    const store = makeStore();
+    const tab = await openTab(store, { html: listing(), url: link, remote, confirm: () => false });
+    await settle();
+    assert.equal(tab.window.location.hash, '');
+    assert.equal(store.read('javstore_sync_config_v1'), undefined);
+    assert.equal(remote.requests.length, before, 'nothing is sent to the worker');
+});
+
+test('a sync link pasted into the endpoint box sets everything up', async () => {
+    const remote = makeRemote();
+    const first = await openDevice(remote);
+    const link = await copyLink(first);
+
+    const store = makeStore();
+    const tab = await openTab(store, { html: listing(), remote });
+    const form = tab.shadow().querySelector('form.sync-form');
+    form.elements.syncEndpoint.value = `here you go: ${link}`;
+    form.dispatchEvent(new tab.window.Event('submit', { bubbles: true, cancelable: true }));
+    await settle();
+
+    const saved = store.read('javstore_sync_config_v1');
+    assert.equal(saved.enabled, true);
+    assert.equal(saved.endpoint, remote.endpoint);
+    assert.equal(saved.token, remote.token);
+    assert.equal(form.elements.syncEndpoint.value, remote.endpoint);
+    assert.equal(form.elements.syncToken.value, '', 'the token is not written back into the page');
+});
+
+test('a mangled sync link changes nothing', async () => {
+    const store = makeStore();
+    const tab = await openTab(store, { html: listing(), url: 'https://javstore.net/#jvs-sync=not-a-real-link' });
+    await settle();
+    assert.equal(tab.window.location.hash, '');
+    assert.equal(store.read('javstore_sync_config_v1'), undefined);
+});

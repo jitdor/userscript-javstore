@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         JavStore Full Layout Cleanup - No Sidebars + Mosaic Overlay
 // @namespace    http://tampermonkey.net/
-// @version      6.7.0
+// @version      6.8.0
 // @description  Clean up JavStore's layout, filter keyword-matched thumbnails, and track visited items with private, configurable controls.
 // @homepageURL  https://github.com/jitdor/userscript-javstore
 // @supportURL   https://github.com/jitdor/userscript-javstore/issues
@@ -23,7 +23,7 @@
 (function () {
     'use strict';
 
-    const SCRIPT_VERSION = '6.7.0';
+    const SCRIPT_VERSION = '6.8.0';
     // The same address as @downloadURL: opening it hands the newest release to the
     // userscript manager, which offers to install it.
     const INSTALL_URL = 'https://github.com/jitdor/userscript-javstore/releases/latest/download/javstore-full-layout-cleanup.user.js';
@@ -1037,6 +1037,121 @@
 
     // Visited history is the payload, so it has to be encrypted in transit. Plain http is
     // accepted only against a loopback worker, which is what `wrangler dev` serves.
+    // ------------------------------------------------------------------
+    // Sync links
+    //
+    // AdGuard for Android clears a userscript's storage when it installs an update, and the
+    // endpoint and token go with it. The only other place a userscript can write is the
+    // site's own storage, which the site's scripts and ads can read, so the token is not kept
+    // there. Instead the panel hands out one link carrying both, which you keep somewhere of
+    // your own; opening it, or pasting it into the endpoint box, sets sync up again in one go.
+    //
+    // The link is a JavStore address with everything after `#`, which browsers never send to
+    // a server. The script takes it off the address bar the moment it runs and asks before
+    // using it: a link from anywhere else could otherwise point this device at a stranger's
+    // worker and hand them the history.
+    // ------------------------------------------------------------------
+
+    const SYNC_LINK_PARAM = 'jvs-sync';
+
+    function encodeSyncLink(config) {
+        const json = JSON.stringify({ v: 1, e: config.endpoint, t: config.token, i: config.intervalMinutes });
+        const bytes = new TextEncoder().encode(json);
+        let binary = '';
+        bytes.forEach(byte => { binary += String.fromCharCode(byte); });
+        const encoded = btoa(binary).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+        return `https://javstore.net/#${SYNC_LINK_PARAM}=${encoded}`;
+    }
+
+    // Finds a sync link anywhere in the text, so a whole pasted message works as well as the
+    // bare link. Returns null for anything that is not a usable one.
+    function parseSyncLink(text) {
+        const match = new RegExp(`${SYNC_LINK_PARAM}=([A-Za-z0-9_-]+)`).exec(String(text || ''));
+        if (!match) return null;
+        try {
+            const base64 = match[1].replace(/-/g, '+').replace(/_/g, '/');
+            const binary = atob(base64 + '='.repeat((4 - (base64.length % 4)) % 4));
+            const bytes = Uint8Array.from(binary, char => char.charCodeAt(0));
+            const parsed = JSON.parse(new TextDecoder().decode(bytes));
+            const endpoint = String(parsed?.e || '').trim();
+            const token = String(parsed?.t || '').trim();
+            if (!isSyncEndpoint(endpoint) || !token) return null;
+            return { endpoint, token, intervalMinutes: parsed.i };
+        } catch (error) {
+            return null;
+        }
+    }
+
+    // Read and wiped before anything else on the page runs, so the token does not sit in
+    // the address bar, the tab's history entry, or anywhere the site's own scripts look.
+    let pendingSyncLink = null;
+    try {
+        if (location.hash.includes(`${SYNC_LINK_PARAM}=`)) {
+            pendingSyncLink = parseSyncLink(location.hash) || false;
+            history.replaceState(history.state, '', location.pathname + location.search);
+        }
+    } catch (error) {
+        // Leaving the address alone is harmless; the link is simply not used.
+    }
+
+    async function applySyncLink(link) {
+        const saved = await writeSyncConfig({
+            ...syncConfig,
+            enabled: true,
+            endpoint: link.endpoint,
+            token: link.token,
+            intervalMinutes: link.intervalMinutes ?? syncConfig.intervalMinutes,
+        });
+        if (ui) fillSyncForm();
+        restartSyncTimer();
+        if (!saved) {
+            showToast('Sync settings could not be saved.', true);
+            return false;
+        }
+        showToast('Sync set up from the link. Syncing…');
+        queueSync({ manual: true });
+        return true;
+    }
+
+    function syncLinkHost(link) {
+        try {
+            return new URL(link.endpoint).host;
+        } catch (error) {
+            return link.endpoint;
+        }
+    }
+
+    async function offerPendingSyncLink() {
+        if (pendingSyncLink === null) return;
+        const link = pendingSyncLink;
+        pendingSyncLink = null;
+        if (!link) {
+            showToast('That sync link is not valid.', true);
+            return;
+        }
+        if (syncConfigured() && syncConfig.endpoint === link.endpoint && syncConfig.token === link.token) {
+            showToast('Sync is already set up with that link.');
+            return;
+        }
+        if (!window.confirm(`Sync this device's history and settings with the worker at ${syncLinkHost(link)}?\n\nOnly continue if this is a sync link you made yourself.`)) return;
+        await applySyncLink(link);
+    }
+
+    async function copySyncLink() {
+        if (!syncConfigured() || !syncConfig.token) {
+            showToast('Turn on cloud sync and save an endpoint and token first.', true);
+            return;
+        }
+        const link = encodeSyncLink(syncConfig);
+        try {
+            await navigator.clipboard.writeText(link);
+            showToast('Sync link copied. Keep it private: it carries your token.');
+        } catch (error) {
+            // No clipboard access (some engines, some browsers): show it to copy by hand.
+            window.prompt('Copy this sync link and keep it private: it carries your token.', link);
+        }
+    }
+
     function isSyncEndpoint(value) {
         try {
             const url = new URL(value);
@@ -2342,12 +2457,13 @@
                 <form class="sync-form">
                     <div class="grid">
                         <label class="check full"><input name="syncEnabled" type="checkbox"> Sync to my Cloudflare Worker</label>
-                        <label class="full">Worker endpoint <input name="syncEndpoint" type="url" spellcheck="false" autocomplete="off" placeholder="https://javstore-sync.example.workers.dev/state"></label>
+                        <label class="full">Worker endpoint or sync link <input name="syncEndpoint" type="url" spellcheck="false" autocomplete="off" placeholder="https://javstore-sync.example.workers.dev/state"></label>
                         <label class="full">Access token <input name="syncToken" type="password" spellcheck="false" autocomplete="off"></label>
                         <p class="muted full">The token is stored by the userscript manager, not kept in the page. Leave the box empty to keep the token already saved.</p>
                         <label>Sync every (minutes) <input name="syncIntervalMinutes" type="number" min="1" max="1440" step="1"></label>
                     </div>
-                    <div class="actions"><button class="primary save-sync" type="submit">Save sync settings</button><button class="sync-now" type="button">Sync now</button></div>
+                    <div class="actions"><button class="primary save-sync" type="submit">Save sync settings</button><button class="sync-now" type="button">Sync now</button><button class="copy-sync-link" type="button">Copy sync link</button></div>
+                    <p class="muted">A sync link carries the endpoint and token together. Keep it somewhere private, such as a password manager. If an update to your userscript manager wipes these settings, open the link on JavStore or paste it into the endpoint box and save.</p>
                 </form>
                 <p class="muted worker-version" hidden></p>
                 <h3>Data</h3>
@@ -2430,6 +2546,13 @@
         });
         syncForm.addEventListener('submit', async event => {
             event.preventDefault();
+            // A sync link pasted into the endpoint box fills in everything it carries. Pasting
+            // it is itself the request, so there is nothing further to confirm.
+            const pasted = parseSyncLink(syncForm.elements.syncEndpoint.value);
+            if (pasted) {
+                await applySyncLink(pasted);
+                return;
+            }
             const next = readSyncForm();
             if (next.enabled && !next.endpoint) {
                 showToast('Sync needs an https worker URL.', true);
@@ -2449,6 +2572,7 @@
             showToast(syncConfigured() ? 'Sync settings saved. Syncing…' : 'Sync settings saved.');
             if (syncConfigured()) queueSync({ manual: true });
         });
+        shadow.querySelector('.copy-sync-link').addEventListener('click', copySyncLink);
         shadow.querySelector('.sync-now').addEventListener('click', () => {
             if (!syncConfigured()) {
                 showToast('Turn on cloud sync and save an endpoint first.', true);
@@ -2549,6 +2673,7 @@
             window.clearTimeout(remotePushTimer);
         });
         queueSync();
+        offerPendingSyncLink();
 
         try {
             GM_registerMenuCommand('Open JavStore Cleanup settings', () => ui?.open());

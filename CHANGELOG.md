@@ -1,5 +1,10 @@
 # Changelog
 
+## 6.8.0
+
+- Add: sync links. AdGuard for Android clears a userscript's storage whenever it installs an update, so every update turned sync off and forgot the worker URL and token. **Copy sync link** in the Cloud sync panel produces one `https://javstore.net/#jvs-sync=…` link that carries the endpoint, token and interval. After a wipe, open the link on the device, or paste it into the endpoint box and save, and sync is set up again and pulls your history and settings back.
+- Security: the link is kept only where you put it, never in the site's storage, where javstore.net's scripts and ads could read it. The part after `#` is never sent to a server, and the script removes it from the address bar as soon as it runs. Opening a link asks first and names the worker it would sync with, because a link from someone else could otherwise send your history to their worker. Pasting a link into the panel counts as saying yes.
+
 ## 6.7.0
 
 - Add: the Cloud sync panel shows which worker version the device is syncing with, taken from the worker's own answers. If the worker is behind the userscript, the line says so and asks you to redeploy it. Workers from 6.7.0 on send their version in every answer. Older workers are recognised from the shape of their answer: `6.6.0`, "older than 6.6.0", or "older than 6.3.0".
