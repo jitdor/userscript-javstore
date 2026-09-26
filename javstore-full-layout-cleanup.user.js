@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         JavStore Full Layout Cleanup - No Sidebars + Mosaic Overlay
 // @namespace    http://tampermonkey.net/
-// @version      6.8.0
+// @version      6.8.1
 // @description  Clean up JavStore's layout, filter keyword-matched thumbnails, and track visited items with private, configurable controls.
 // @homepageURL  https://github.com/jitdor/userscript-javstore
 // @supportURL   https://github.com/jitdor/userscript-javstore/issues
@@ -17,13 +17,19 @@
 // @grant        GM_addValueChangeListener
 // @grant        GM_registerMenuCommand
 // @grant        GM_xmlhttpRequest
+// @grant        GM.getValue
+// @grant        GM.setValue
+// @grant        GM.listValues
+// @grant        GM.deleteValue
+// @grant        GM.addStyle
+// @grant        GM.xmlHttpRequest
 // @connect      *
 // ==/UserScript==
 
 (function () {
     'use strict';
 
-    const SCRIPT_VERSION = '6.8.0';
+    const SCRIPT_VERSION = '6.8.1';
     // The same address as @downloadURL: opening it hands the newest release to the
     // userscript manager, which offers to install it.
     const INSTALL_URL = 'https://github.com/jitdor/userscript-javstore/releases/latest/download/javstore-full-layout-cleanup.user.js';
@@ -286,12 +292,39 @@
         return raw && typeof raw === 'object' ? raw : null;
     }
 
+    // The Userscripts app for Safari (iOS and macOS) offers only the dotted GM4 API—
+    // GM.getValue, GM.setValue and the rest—and no GM_* functions at all, so calling
+    // GM_setValue there threw a ReferenceError: nothing was ever stored, and saving the
+    // sync settings or pasting a sync link reported that they could not be saved. Each
+    // call is looked up here instead, preferring GM_* where both exist. GM_* functions are
+    // often locals of the manager's wrapper rather than globals, so each is named directly
+    // behind `typeof`, which does not throw when it is missing.
+    const dottedGm = name => (typeof GM === 'object' && GM && typeof GM[name] === 'function'
+        ? GM[name].bind(GM)
+        : null);
+    const gm = {
+        getValue: typeof GM_getValue === 'function' ? GM_getValue : dottedGm('getValue'),
+        setValue: typeof GM_setValue === 'function' ? GM_setValue : dottedGm('setValue'),
+        listValues: typeof GM_listValues === 'function' ? GM_listValues : dottedGm('listValues'),
+        deleteValue: typeof GM_deleteValue === 'function' ? GM_deleteValue : dottedGm('deleteValue'),
+        addStyle: typeof GM_addStyle === 'function' ? GM_addStyle : dottedGm('addStyle'),
+    };
+
+    function gmCall(name, ...args) {
+        if (!gm[name]) return Promise.reject(new Error(`GM ${name} is not available`));
+        try {
+            return Promise.resolve(gm[name](...args));
+        } catch (error) {
+            return Promise.reject(error);
+        }
+    }
+
     async function loadValue(key) {
-        return decodeValue(await Promise.resolve(GM_getValue(key, null)), key);
+        return decodeValue(await gmCall('getValue', key, null), key);
     }
 
     function storeValue(key, value) {
-        return Promise.resolve(GM_setValue(key, JSON.stringify(value)));
+        return gmCall('setValue', key, JSON.stringify(value));
     }
 
     async function readStoredState() {
@@ -358,14 +391,14 @@
     // ------------------------------------------------------------------
 
     function journalingAvailable() {
-        return typeof GM_listValues === 'function' && typeof GM_deleteValue === 'function';
+        return Boolean(gm.listValues && gm.deleteValue);
     }
 
     async function readJournals() {
         if (!journalingAvailable()) return [];
         let keys;
         try {
-            keys = await Promise.resolve(GM_listValues());
+            keys = await gmCall('listValues');
         } catch (error) {
             return [];
         }
@@ -561,7 +594,7 @@
             journalWritten = true;
         } else if (journalWritten) {
             // Everything it held has been safely in the main document for a TTL.
-            await Promise.resolve(GM_deleteValue(journalKey));
+            await gmCall('deleteValue', journalKey);
             journalWritten = false;
         }
     }
@@ -580,7 +613,7 @@
                 // left for a later save to merge.
                 const current = await loadValue(key);
                 if (current && parseTimestamp(current.writtenAt) !== writtenAt) continue;
-                await Promise.resolve(GM_deleteValue(key));
+                await gmCall('deleteValue', key);
             } catch (error) {
                 // Left in place; the next save tries again.
             }
@@ -1784,7 +1817,8 @@
 
     function installPageCss() {
         try {
-            GM_addStyle(pageCss);
+            if (!gm.addStyle) throw new Error('GM addStyle is not available');
+            gm.addStyle(pageCss);
         } catch (error) {
             const style = document.createElement('style');
             style.textContent = pageCss;

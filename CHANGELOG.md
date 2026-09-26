@@ -1,5 +1,9 @@
 # Changelog
 
+## 6.8.1
+
+- Fix: on the Userscripts app for Safari (iPhone, iPad and Mac), nothing was ever saved. Pasting a sync link, or saving the sync settings by hand, showed "Sync settings could not be saved", and visited history was gone after every reload. That app offers only the dotted GM4 API (`GM.getValue`, `GM.setValue`, …) and no `GM_*` functions, so every storage call failed. The script now uses whichever of the two forms the userscript manager provides, and requests the `GM.*` grants too. After updating, paste the sync link again and save.
+
 ## 6.8.0
 
 - Add: sync links. AdGuard for Android clears a userscript's storage whenever it installs an update, so every update turned sync off and forgot the worker URL and token. **Copy sync link** in the Cloud sync panel produces one `https://javstore.net/#jvs-sync=…` link that carries the endpoint, token and interval. After a wipe, open the link on the device, or paste it into the endpoint box and save, and sync is set up again and pulls your history and settings back.
