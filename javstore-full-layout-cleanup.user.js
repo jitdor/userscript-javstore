@@ -24,6 +24,9 @@
     'use strict';
 
     const SCRIPT_VERSION = '6.7.0';
+    // The same address as @downloadURL: opening it hands the newest release to the
+    // userscript manager, which offers to install it.
+    const INSTALL_URL = 'https://github.com/jitdor/userscript-javstore/releases/latest/download/javstore-full-layout-cleanup.user.js';
     const STORAGE_VERSION = 3;
     const STORAGE_KEY = 'javstore_cleanup_state_v2';
     const LEGACY_STORAGE_KEY = 'javstore_seen_links';
@@ -1476,6 +1479,14 @@
             : `Worker version: ${remoteWorkerVersion}.`;
     }
 
+    // The worker deploys from the same commit the release is cut from, so a worker ahead of
+    // this script means a newer script is out that the manager has not installed yet.
+    function scriptBehindWorker() {
+        return syncConfigured()
+            && /^\d+(\.\d+)*$/.test(remoteWorkerVersion)
+            && compareVersions(remoteWorkerVersion, SCRIPT_VERSION) > 0;
+    }
+
     function describeSyncState() {
         if (!syncConfig.enabled) return 'cloud sync off';
         if (!syncConfig.endpoint) return 'cloud sync needs an endpoint';
@@ -1966,6 +1977,12 @@
         const workerVersion = describeWorkerVersion();
         ui.workerVersion.textContent = workerVersion;
         ui.workerVersion.hidden = !workerVersion;
+        const behind = scriptBehindWorker();
+        ui.updateButton.hidden = !behind;
+        ui.updateWarning.hidden = !behind;
+        if (behind) {
+            ui.updateVersions.textContent = `This script is ${SCRIPT_VERSION}, but your sync worker is already on ${remoteWorkerVersion}.`;
+        }
     }
 
     function showToast(message, isError = false) {
@@ -2227,6 +2244,10 @@
                 p { margin: 6px 0; }
                 .muted { color: #9ca3af; font-size: 12px; }
                 .warning { padding: 8px; border-radius: 8px; color: #fecaca; background: #7f1d1d; }
+                .warning a { color: #fff; }
+                .pill.update { border-color: #fca5a5; background: #991b1b; }
+                .pill.update:hover { background: #7f1d1d; }
+                .pill[hidden], .warning[hidden] { display: none; }
                 .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
                 .full { grid-column: 1 / -1; }
                 label { display: grid; gap: 5px; color: #d1d5db; }
@@ -2264,6 +2285,7 @@
                 @media (prefers-reduced-motion: reduce) { .toast { transition: none; } }
             </style>
             <div class="dock" aria-label="JavStore cleanup controls">
+                <button class="pill update" type="button" hidden>⚠ Update script</button>
                 <button class="pill lift" type="button">Reveal all</button>
                 <button class="pill summary" type="button" aria-expanded="false">JavStore controls</button>
             </div>
@@ -2272,6 +2294,7 @@
                     <div><h2>JavStore Cleanup</h2><p class="muted">Version ${SCRIPT_VERSION}</p></div>
                     <button class="icon-button close" type="button" aria-label="Close settings">×</button>
                 </div>
+                <p class="warning update-warning" hidden><span class="update-versions"></span> Settings or history the worker now handles may not sync correctly until you update. <a class="install" href="${INSTALL_URL}" target="_blank" rel="noopener noreferrer">Install the latest version</a>, or run your userscript manager's update check.</p>
                 <p class="warning storage-warning" hidden>Private storage is unavailable. Changes will work for this page but cannot be saved.</p>
                 <p class="counts muted"></p>
                 <form class="settings-form">
@@ -2349,6 +2372,9 @@
             counts: shadow.querySelector('.counts'),
             workerVersion: shadow.querySelector('.worker-version'),
             storageWarning: shadow.querySelector('.storage-warning'),
+            updateButton: shadow.querySelector('.update'),
+            updateWarning: shadow.querySelector('.update-warning'),
+            updateVersions: shadow.querySelector('.update-versions'),
             selectedTitle: shadow.querySelector('.selected-title'),
             overrideButton: shadow.querySelector('.card-override'),
             toast: shadow.querySelector('.toast'),
@@ -2369,6 +2395,7 @@
         summary.addEventListener('click', () => setPanelOpen(panel.hidden));
         shadow.querySelector('.close').addEventListener('click', () => setPanelOpen(false));
         liftButton.addEventListener('click', toggleOverlays);
+        shadow.querySelector('.update').addEventListener('click', () => setPanelOpen(true));
         form.addEventListener('submit', event => {
             event.preventDefault();
             applySettings(readSettingsForm());

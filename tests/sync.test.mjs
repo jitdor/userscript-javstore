@@ -864,6 +864,9 @@ test('the worker reports the same version as the userscript', () => {
     const source = fs.readFileSync(new URL('../javstore-full-layout-cleanup.user.js', import.meta.url), 'utf8');
     const declared = /^\/\/ @version\s+(\S+)/m.exec(source)[1];
     assert.equal(WORKER_VERSION, declared);
+    // The on-screen update link is the manager's own update source, not a second copy of it.
+    const download = /^\/\/ @downloadURL\s+(\S+)/m.exec(source)[1];
+    assert.equal(/const INSTALL_URL = '([^']+)'/.exec(source)[1], download);
 });
 
 test('the panel shows the version the worker reports', async () => {
@@ -898,6 +901,48 @@ test('an older worker is named from its answer and flagged for redeploying', asy
         await syncNow(tab);
         assert.match(workerVersionText(tab).textContent, new RegExp(`^Worker version: ${expected}, behind this script`));
         assert.match(workerVersionText(tab).textContent, /Redeploy the worker/);
+        closeTabs();
+    }
+});
+
+// The worker deploys from the commit a release is cut from, so a worker ahead of the script
+// means the userscript manager has not installed the newer release yet.
+test('a script behind its worker says so on screen', async () => {
+    const remote = makeRemote();
+    const reach = remote.handle;
+    remote.handle = async request => {
+        const response = await reach(request);
+        return { ...response, text: JSON.stringify({ ...JSON.parse(response.text), worker: '99.0.0' }) };
+    };
+    const tab = await openDevice(remote);
+    await syncNow(tab);
+
+    const pill = tab.shadow().querySelector('.update');
+    const banner = tab.shadow().querySelector('.update-warning');
+    assert.equal(pill.hidden, false);
+    assert.equal(banner.hidden, false);
+    assert.match(banner.textContent, /This script is \d+\.\d+\.\d+, but your sync worker is already on 99\.0\.0/);
+    assert.match(banner.querySelector('a.install').href, /releases\/latest\/download\/javstore-full-layout-cleanup\.user\.js$/);
+    assert.match(workerVersionText(tab).textContent, /^Worker version: 99\.0\.0\.$/);
+
+    pill.click();
+    await settle();
+    assert.equal(tab.shadow().querySelector('.panel').hidden, false);
+});
+
+test('a script level with or ahead of its worker shows no update warning', async () => {
+    for (const reported of [WORKER_VERSION, '6.6.0', null]) {
+        const remote = makeRemote();
+        const reach = remote.handle;
+        remote.handle = async request => {
+            const response = await reach(request);
+            const { worker: _version, ...answer } = JSON.parse(response.text);
+            return { ...response, text: JSON.stringify(reported ? { ...answer, worker: reported } : answer) };
+        };
+        const tab = await openDevice(remote);
+        await syncNow(tab);
+        assert.equal(tab.shadow().querySelector('.update').hidden, true, `worker ${reported}`);
+        assert.equal(tab.shadow().querySelector('.update-warning').hidden, true, `worker ${reported}`);
         closeTabs();
     }
 });
