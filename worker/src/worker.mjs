@@ -28,6 +28,40 @@ function timestamp(value) {
     return Number.isFinite(time) && time > 0 ? Math.floor(time) : 0;
 }
 
+// When each setting was last changed, keyed by setting name. A device or a stored copy
+// from before the per-field stamps says only when its settings as a whole last changed, and
+// that time stands in for every field it carries.
+function settingTimes(settings, times, wholeAt) {
+    const result = {};
+    if (!settings || typeof settings !== 'object') return result;
+    const stamped = times && typeof times === 'object' && !Array.isArray(times);
+    for (const field of Object.keys(settings)) {
+        const at = stamped ? timestamp(times[field]) : timestamp(wholeAt);
+        if (at) result[field] = at;
+    }
+    return result;
+}
+
+// Each field goes to whichever side changed it last, with a tie between different values
+// settled on the values themselves—the rule the userscript applies, so both sides agree.
+function mergeSettings(current, currentTimes, incoming, incomingTimes) {
+    const settings = { ...(current || {}) };
+    const times = { ...currentTimes };
+    let changed = false;
+    for (const [field, at] of Object.entries(incomingTimes)) {
+        if (!Object.prototype.hasOwnProperty.call(incoming, field)) continue;
+        const known = timestamp(times[field]);
+        if (at < known) continue;
+        const next = JSON.stringify(incoming[field]);
+        const held = JSON.stringify(settings[field]);
+        if (at === known && !(next > held)) continue;
+        settings[field] = incoming[field];
+        times[field] = at;
+        changed = true;
+    }
+    return { settings, times, changed };
+}
+
 function overrideValue(value) {
     return value === 'allow' || value === 'block' ? value : null;
 }
@@ -93,6 +127,7 @@ export class SyncStore {
             prunedBefore: timestamp(this.#meta('prunedBefore', 0)),
             settings: this.#meta('settings', null),
             settingsUpdatedAt: timestamp(this.#meta('settingsUpdatedAt', 0)),
+            settingTimes: this.#meta('settingTimes', null),
         };
     }
 
@@ -114,14 +149,26 @@ export class SyncStore {
             this.sql.exec('DELETE FROM entries WHERE kind = ? AND deleted = 0 AND at <= ?', 'v', prunedBefore);
         }
 
-        // Settings carry their own timestamp, so a device that has never changed one sends a
-        // zero and can never push its defaults over another device's choices.
-        const settingsUpdatedAt = timestamp(meta.settingsUpdatedAt);
-        if (meta.settings && typeof meta.settings === 'object'
-            && (settingsUpdatedAt > current.settingsUpdatedAt || !current.settings)) {
+        // Each setting carries its own timestamp, so a device that has never changed one
+        // sends a zero for it and can never push its default over another device's choice,
+        // and a device that changed only its tint does not bring its keywords along.
+        if (!meta.settings || typeof meta.settings !== 'object' || Array.isArray(meta.settings)) return;
+        const incomingTimes = settingTimes(meta.settings, meta.settingTimes, meta.settingsUpdatedAt);
+        if (!current.settings) {
             this.#setMeta('settings', meta.settings);
-            this.#setMeta('settingsUpdatedAt', settingsUpdatedAt);
+            this.#setMeta('settingTimes', incomingTimes);
+            this.#setMeta('settingsUpdatedAt', timestamp(meta.settingsUpdatedAt));
+            return;
         }
+        const currentTimes = settingTimes(current.settings, current.settingTimes, current.settingsUpdatedAt);
+        const merged = mergeSettings(current.settings, currentTimes, meta.settings, incomingTimes);
+        if (!merged.changed) return;
+        this.#setMeta('settings', merged.settings);
+        this.#setMeta('settingTimes', merged.times);
+        this.#setMeta('settingsUpdatedAt', Math.max(
+            current.settingsUpdatedAt,
+            ...Object.values(merged.times),
+        ));
     }
 
     #existing(kind, key) {
@@ -256,6 +303,7 @@ export class SyncStore {
             version: STORAGE_VERSION,
             updatedAt: Date.now(),
             settingsUpdatedAt: meta.settingsUpdatedAt,
+            ...(meta.settingTimes ? { settingTimes: meta.settingTimes } : {}),
             resetAt: meta.resetAt,
             prunedBefore: meta.prunedBefore,
             settings: meta.settings,
@@ -271,6 +319,7 @@ export class SyncStore {
             resetAt: state.resetAt,
             prunedBefore: state.prunedBefore,
             settings: state.settings,
+            settingTimes: state.settingTimes,
             settingsUpdatedAt: Object.prototype.hasOwnProperty.call(state, 'settingsUpdatedAt')
                 ? state.settingsUpdatedAt
                 : state.updatedAt,

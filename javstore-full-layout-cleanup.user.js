@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         JavStore Full Layout Cleanup - No Sidebars + Mosaic Overlay
 // @namespace    http://tampermonkey.net/
-// @version      6.5.1
+// @version      6.6.0
 // @description  Clean up JavStore's layout, filter keyword-matched thumbnails, and track visited items with private, configurable controls.
 // @homepageURL  https://github.com/jitdor/userscript-javstore
 // @supportURL   https://github.com/jitdor/userscript-javstore/issues
@@ -23,7 +23,7 @@
 (function () {
     'use strict';
 
-    const SCRIPT_VERSION = '6.5.1';
+    const SCRIPT_VERSION = '6.6.0';
     const STORAGE_VERSION = 3;
     const STORAGE_KEY = 'javstore_cleanup_state_v2';
     const LEGACY_STORAGE_KEY = 'javstore_seen_links';
@@ -106,6 +106,11 @@
     let resetAt = 0;
     let prunedBefore = 0;
     let settingsUpdatedAt = 0;
+    // When each setting was last changed on purpose, keyed by setting name. Settings merge
+    // field by field on these, so changing one setting on one device does not carry that
+    // device's copy of every other setting along with it; `settingsUpdatedAt` is the
+    // newest of them, kept for documents and workers that predate the per-field stamps.
+    let settingTimes = {};
     let lastKnownUpdatedAt = 0;
     let lastSavedAt = 0;
     let lastSaveFailed = false;
@@ -381,6 +386,47 @@
             : parseTimestamp(doc.updatedAt);
     }
 
+    // When each setting in a document was last changed. A document from before the
+    // per-field stamps says only when its settings as a whole last changed, which stands in
+    // for every field; one that has never had its settings touched says zero, so none of its
+    // defaults can outrank a choice made anywhere else.
+    function documentSettingTimes(doc) {
+        const times = {};
+        if (!doc || typeof doc !== 'object') return times;
+        const stamped = doc.settingTimes && typeof doc.settingTimes === 'object' && !Array.isArray(doc.settingTimes);
+        const whole = documentSettingsAt(doc);
+        Object.keys(DEFAULT_SETTINGS).forEach(field => {
+            const at = stamped ? parseTimestamp(doc.settingTimes[field]) : whole;
+            if (at) times[field] = at;
+        });
+        return times;
+    }
+
+    // Takes each field from whichever side changed it last. A tie between different values
+    // is settled on the values themselves, so every device and the worker pick the same one.
+    function mergeSettingFields(local, localTimes, remote, remoteTimes) {
+        const result = { settings: { ...local }, times: { ...localTimes }, changed: false, adopted: false };
+        Object.keys(DEFAULT_SETTINGS).forEach(field => {
+            const remoteAt = parseTimestamp(remoteTimes[field]);
+            const localAt = parseTimestamp(localTimes[field]);
+            if (!remoteAt || remoteAt < localAt) return;
+            const remoteValue = JSON.stringify(remote[field]);
+            const localValue = JSON.stringify(local[field]);
+            if (remoteAt === localAt && !(remoteValue > localValue)) return;
+            if (remoteValue !== localValue) {
+                result.settings[field] = remote[field];
+                result.changed = true;
+            }
+            result.times[field] = remoteAt;
+            result.adopted = true;
+        });
+        return result;
+    }
+
+    function newestSettingTime(times) {
+        return Object.values(times).reduce((newest, at) => Math.max(newest, parseTimestamp(at)), 0);
+    }
+
     // Folds the journals into a copy of the main document, keeping the newest of each
     // entry. Removals and horizons are only carried along, not applied: mergeStoredState
     // does that for whoever reads the result.
@@ -392,6 +438,7 @@
             ...base,
             updatedAt: parseTimestamp(base.updatedAt),
             settingsUpdatedAt: main ? documentSettingsAt(base) : 0,
+            settingTimes: main ? documentSettingTimes(base) : {},
             resetAt: parseTimestamp(base.resetAt),
             prunedBefore: parseTimestamp(base.prunedBefore),
             visited: { ...(base.visited && typeof base.visited === 'object' ? base.visited : {}) },
@@ -420,10 +467,16 @@
                     combined.overrideTimes[url] = at;
                 }
             });
-            const settingsAt = parseTimestamp(doc.settingsUpdatedAt);
-            if (doc.settings && typeof doc.settings === 'object' && settingsAt > combined.settingsUpdatedAt) {
-                combined.settings = doc.settings;
-                combined.settingsUpdatedAt = settingsAt;
+            if (doc.settings && typeof doc.settings === 'object') {
+                const merged = mergeSettingFields(
+                    sanitizeSettings(combined.settings), combined.settingTimes,
+                    sanitizeSettings(doc.settings), documentSettingTimes(doc),
+                );
+                if (merged.adopted) {
+                    combined.settings = merged.settings;
+                    combined.settingTimes = merged.times;
+                    combined.settingsUpdatedAt = Math.max(combined.settingsUpdatedAt, newestSettingTime(merged.times));
+                }
             }
         });
         return combined;
@@ -483,6 +536,7 @@
         if (settingsUpdatedAt) {
             journal.settings = { ...settings };
             journal.settingsUpdatedAt = settingsUpdatedAt;
+            journal.settingTimes = { ...settingTimes };
         }
         return journal;
     }
@@ -533,6 +587,7 @@
             scriptVersion: SCRIPT_VERSION,
             updatedAt: Date.now(),
             settingsUpdatedAt,
+            settingTimes: { ...settingTimes },
             resetAt,
             prunedBefore,
             settings: { ...settings },
@@ -590,13 +645,6 @@
         const remoteReset = parseTimestamp(stored.resetAt);
         const remotePruned = parseTimestamp(stored.prunedBefore);
         const remoteUpdatedAt = parseTimestamp(stored.updatedAt);
-        // A document written before this field existed carries its settings' age in
-        // `updatedAt`; one that carries the field with a zero has never had its settings
-        // touched, and must not be read as "as new as the document" or an untouched device
-        // would push its defaults over everyone else's choices.
-        const remoteSettingsAt = Object.prototype.hasOwnProperty.call(stored, 'settingsUpdatedAt')
-            ? parseTimestamp(stored.settingsUpdatedAt)
-            : remoteUpdatedAt;
         let changed = false;
         let adopted = false;
 
@@ -677,15 +725,20 @@
 
         // Only a document that actually carries settings may replace the local ones: an
         // empty remote store must not reset this device to the defaults.
-        if (adoptSettings && stored.settings && typeof stored.settings === 'object'
-            && remoteSettingsAt > settingsUpdatedAt) {
-            const remoteSettings = sanitizeSettings(stored.settings);
-            if (JSON.stringify(remoteSettings) !== JSON.stringify(settings)) {
-                settings = remoteSettings;
-                changed = true;
+        // Each field is taken on its own, so a device that changed only its tint cannot
+        // hand back its copy of the keywords with it.
+        if (adoptSettings && stored.settings && typeof stored.settings === 'object') {
+            const merged = mergeSettingFields(
+                settings, settingTimes,
+                sanitizeSettings(stored.settings), documentSettingTimes(stored),
+            );
+            if (merged.adopted) {
+                settings = merged.settings;
+                settingTimes = merged.times;
+                settingsUpdatedAt = Math.max(settingsUpdatedAt, newestSettingTime(settingTimes));
+                adopted = true;
+                if (merged.changed) changed = true;
             }
-            settingsUpdatedAt = remoteSettingsAt;
-            adopted = true;
         }
 
         lastKnownUpdatedAt = Math.max(lastKnownUpdatedAt, remoteUpdatedAt);
@@ -1184,7 +1237,7 @@
     }
 
     function localMeta() {
-        return { resetAt, prunedBefore, settings: { ...settings }, settingsUpdatedAt };
+        return { resetAt, prunedBefore, settings: { ...settings }, settingsUpdatedAt, settingTimes: { ...settingTimes } };
     }
 
     // Rows come back in the delta shape; turning them into a document lets the merge that
@@ -1216,6 +1269,9 @@
             prunedBefore: safeMeta.prunedBefore,
             settings: safeMeta.settings,
             settingsUpdatedAt: parseTimestamp(safeMeta.settingsUpdatedAt),
+            ...(safeMeta.settingTimes && typeof safeMeta.settingTimes === 'object'
+                ? { settingTimes: safeMeta.settingTimes }
+                : {}),
             visited: visitedRows,
             overrides: overrideRows,
             overrideTimes: overrideTimeRows,
@@ -1970,9 +2026,20 @@
         elements.syncIntervalMinutes.value = syncConfig.intervalMinutes;
     }
 
-    function applySettings(nextSettings, message = 'Settings applied.') {
-        settings = sanitizeSettings(nextSettings);
-        settingsUpdatedAt = Date.now();
+    // Only the fields that actually changed are stamped, unless every one is being set on
+    // purpose (restoring the defaults), so saving the panel after changing one thing does
+    // not claim all the others as this device's newest choice.
+    function stampSettings(next, { all = false } = {}) {
+        const now = Math.max(Date.now(), settingsUpdatedAt + 1);
+        Object.keys(DEFAULT_SETTINGS).forEach(field => {
+            if (all || JSON.stringify(next[field]) !== JSON.stringify(settings[field])) settingTimes[field] = now;
+        });
+        settings = next;
+        settingsUpdatedAt = Math.max(settingsUpdatedAt, newestSettingTime(settingTimes));
+    }
+
+    function applySettings(nextSettings, message = 'Settings applied.', { all = false } = {}) {
+        stampSettings(sanitizeSettings(nextSettings), { all });
         pruneVisited();
         setRootState();
         processAllCards();
@@ -2048,8 +2115,7 @@
             for (const url of restored.keys()) tombstones.delete(tombstoneKey('v', url));
             for (const url of restoredOverrides.keys()) tombstones.delete(tombstoneKey('o', url));
 
-            settings = sanitizeSettings(parsed.settings);
-            settingsUpdatedAt = now;
+            stampSettings(sanitizeSettings(parsed.settings), { all: true });
             visited = restored;
             overrides = restoredOverrides;
             overrideTimes = restoredOverrideTimes;
@@ -2271,7 +2337,7 @@
             applySettings(readSettingsForm());
         });
         shadow.querySelector('.reset').addEventListener('click', () => {
-            applySettings({ ...DEFAULT_SETTINGS }, 'Default settings restored.');
+            applySettings({ ...DEFAULT_SETTINGS }, 'Default settings restored.', { all: true });
         });
         shadow.querySelector('.card-reveal').addEventListener('click', () => toggleCardReveal(selectedCard));
         shadow.querySelector('.card-visited').addEventListener('click', () => {
@@ -2441,6 +2507,7 @@
         prunedBefore = parseTimestamp(initialState?.prunedBefore);
         lastKnownUpdatedAt = parseTimestamp(initialState?.updatedAt);
         settingsUpdatedAt = parseTimestamp(initialState?.settingsUpdatedAt) || lastKnownUpdatedAt;
+        settingTimes = documentSettingTimes(initialState);
         const replayed = replayPendingVisits();
         pruneVisited();
         await migrateLegacyHistory();

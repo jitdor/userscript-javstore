@@ -147,6 +147,92 @@ test('an empty worker does not reset a device to the default settings', async ()
     assert.equal(remote.state().settings.mode, 'hide');
 });
 
+function submitSettings(tab, fields) {
+    const form = tab.shadow().querySelector('form.settings-form');
+    Object.entries(fields).forEach(([name, value]) => { form.elements[name].value = value; });
+    form.dispatchEvent(new tab.window.Event('submit', { bubbles: true, cancelable: true }));
+    return settle();
+}
+
+// Settings used to travel as one blob, newest wins: a new install that changed anything
+// at all before its first sync pushed its default keywords over everyone else's.
+test('a new install that changed one setting does not overwrite the keywords', async () => {
+    const remote = makeRemote();
+    const first = await openDevice(remote);
+    await submitSettings(first, { keywords: 'alpha, beta', excludedKeywords: 'gamma' });
+    await syncNow(first);
+    assert.deepEqual(remote.state().settings.keywords, ['alpha', 'beta']);
+
+    const store = makeStore();
+    const fresh = await openTab(store, { html: listing() });
+    await submitSettings(fresh, { mode: 'blur' });
+    enableSync(store, remote);
+    const second = await openTab(store, { html: listing(), remote });
+    await settle();
+
+    const form = second.shadow().querySelector('form.settings-form');
+    assert.equal(form.elements.keywords.value, 'alpha, beta');
+    assert.equal(form.elements.excludedKeywords.value, 'gamma');
+    assert.equal(form.elements.mode.value, 'blur');
+    assert.deepEqual(remote.state().settings.keywords, ['alpha', 'beta']);
+    assert.deepEqual(remote.state().settings.excludedKeywords, ['gamma']);
+    assert.equal(remote.state().settings.mode, 'blur');
+
+    // And the first device picks up the one change without losing its own.
+    await syncNow(first);
+    const firstForm = first.shadow().querySelector('form.settings-form');
+    assert.equal(firstForm.elements.mode.value, 'blur');
+    assert.equal(firstForm.elements.keywords.value, 'alpha, beta');
+});
+
+test('two devices changing different settings keep both changes', async () => {
+    const remote = makeRemote();
+    const first = await openDevice(remote);
+    const second = await openDevice(remote, { store: makeStore() });
+    await submitSettings(first, { keywords: 'alpha' });
+    await submitSettings(second, { excludedKeywords: 'gamma' });
+    await syncNow(first);
+    await syncNow(second);
+    await syncNow(first);
+
+    for (const tab of [first, second]) {
+        const form = tab.shadow().querySelector('form.settings-form');
+        assert.equal(form.elements.keywords.value, 'alpha');
+        assert.equal(form.elements.excludedKeywords.value, 'gamma');
+    }
+});
+
+// A worker that was holding settings before the per-field stamps has one timestamp for all
+// of them; a device that then changes one setting must not take the rest with it.
+test('settings a worker held from an older version are merged field by field', async () => {
+    const remote = makeRemote();
+    const olderAt = Date.now() - 60000;
+    await remote.handle({
+        method: 'POST',
+        url: remote.endpoint,
+        headers: { Authorization: `Bearer ${remote.token}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+            cursor: 0,
+            changes: [],
+            meta: { settings: { keywords: ['alpha'], excludedKeywords: ['gamma'], mode: 'tint' }, settingsUpdatedAt: olderAt },
+        }),
+    });
+
+    const store = makeStore();
+    const fresh = await openTab(store, { html: listing() });
+    await submitSettings(fresh, { mode: 'hide' });
+    enableSync(store, remote);
+    const device = await openTab(store, { html: listing(), remote });
+    await settle();
+
+    const form = device.shadow().querySelector('form.settings-form');
+    assert.equal(form.elements.keywords.value, 'alpha');
+    assert.equal(form.elements.excludedKeywords.value, 'gamma');
+    assert.equal(form.elements.mode.value, 'hide');
+    assert.deepEqual(remote.state().settings.keywords, ['alpha']);
+    assert.equal(remote.state().settings.mode, 'hide');
+});
+
 test('the endpoint and token never enter the synced document', async () => {
     const remote = makeRemote({ token: 'super-secret-token' });
     const store = makeStore();
