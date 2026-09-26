@@ -43,6 +43,22 @@ Deploying with `workers_dev = false` and no route leaves the worker unreachable.
 rather use the free subdomain, comment `workers_dev` out and `wrangler deploy` prints the URL,
 e.g. `https://javstore-sync.<subdomain>.workers.dev`.
 
+### Deploy on every push
+
+Workers & Pages → `javstore-sync` → **Settings** → **Builds** → **Connect** links the worker to
+this repository, so every push to `main` deploys it:
+
+| Setting | Value |
+| --- | --- |
+| Production branch | `main` |
+| Build command | *(empty — there is nothing to build)* |
+| Deploy command | `npx wrangler deploy` |
+| Root directory | `/worker` — `wrangler.toml` lives here, not at the repository root |
+
+The `SYNC_TOKEN` secret and any route or custom domain stay on the worker, so they survive a
+rebuild. To confirm a deploy landed, open the userscript's Cloud sync panel and press
+**Sync now**: the worker version shown there should match the release.
+
 ## Point the userscript at it
 
 Open the `JVS` panel on JavStore → **Cloud sync**:
