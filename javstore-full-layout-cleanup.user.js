@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         JavStore Full Layout Cleanup - No Sidebars + Mosaic Overlay
 // @namespace    http://tampermonkey.net/
-// @version      6.5.0
+// @version      6.6.0
 // @description  Clean up JavStore's layout, filter keyword-matched thumbnails, and track visited items with private, configurable controls.
 // @homepageURL  https://github.com/jitdor/userscript-javstore
 // @supportURL   https://github.com/jitdor/userscript-javstore/issues
@@ -23,7 +23,7 @@
 (function () {
     'use strict';
 
-    const SCRIPT_VERSION = '6.5.0';
+    const SCRIPT_VERSION = '6.6.0';
     const STORAGE_VERSION = 3;
     const STORAGE_KEY = 'javstore_cleanup_state_v2';
     const LEGACY_STORAGE_KEY = 'javstore_seen_links';
@@ -106,6 +106,11 @@
     let resetAt = 0;
     let prunedBefore = 0;
     let settingsUpdatedAt = 0;
+    // When each setting was last changed on purpose, keyed by setting name. Settings merge
+    // field by field on these, so changing one setting on one device does not carry that
+    // device's copy of every other setting along with it; `settingsUpdatedAt` is the
+    // newest of them, kept for documents and workers that predate the per-field stamps.
+    let settingTimes = {};
     let lastKnownUpdatedAt = 0;
     let lastSavedAt = 0;
     let lastSaveFailed = false;
@@ -254,6 +259,35 @@
     // Promise.resolve() handles both without needing to detect which one we're on—but it
     // does mean a plain object is never mistaken for stored state; a Promise passing
     // `typeof === 'object'` unchecked previously made every reload look empty.
+    // Every value goes into storage as a JSON string and is decoded on the way out. The
+    // GM4 API only promises to keep strings, numbers and booleans, and AdGuard for Android
+    // holds to that: an object is handed straight back while the page stays open—so the
+    // read-back after a save passes—but what reaches disk is not the object, and after a
+    // reload the key reads as empty. That took the history and the sync switch with it
+    // on every refresh. Values an older version stored as plain objects still decode.
+    function decodeValue(raw, key) {
+        if (typeof raw === 'string') {
+            try {
+                const parsed = JSON.parse(raw);
+                return parsed && typeof parsed === 'object' ? parsed : null;
+            } catch (error) {
+                // "[object Object]" is what such an engine kept of an object written by an
+                // older version; there is nothing left to recover from it.
+                console.warn(`[JVS] Stored value ${key} could not be decoded.`);
+                return null;
+            }
+        }
+        return raw && typeof raw === 'object' ? raw : null;
+    }
+
+    async function loadValue(key) {
+        return decodeValue(await Promise.resolve(GM_getValue(key, null)), key);
+    }
+
+    function storeValue(key, value) {
+        return Promise.resolve(GM_setValue(key, JSON.stringify(value)));
+    }
+
     async function readStoredState() {
         return combineSnapshot(await readStorageSnapshot());
     }
@@ -285,9 +319,8 @@
     async function readStorageSnapshot() {
         let main = null;
         try {
-            const state = await Promise.resolve(GM_getValue(STORAGE_KEY, null));
+            main = await loadValue(STORAGE_KEY);
             storageAvailable = true;
-            if (state && typeof state === 'object') main = state;
         } catch (error) {
             storageAvailable = false;
             console.warn('[JVS] Isolated storage could not be read.', error);
@@ -337,8 +370,7 @@
             .filter(key => typeof key === 'string' && key.startsWith(JOURNAL_KEY_PREFIX))
             .map(async key => {
                 try {
-                    const doc = await Promise.resolve(GM_getValue(key, null));
-                    return { key, doc: doc && typeof doc === 'object' ? doc : null };
+                    return { key, doc: await loadValue(key) };
                 } catch (error) {
                     // An unreadable journal is skipped for this read; it is retried on the next.
                     return null;
@@ -354,6 +386,47 @@
             : parseTimestamp(doc.updatedAt);
     }
 
+    // When each setting in a document was last changed. A document from before the
+    // per-field stamps says only when its settings as a whole last changed, which stands in
+    // for every field; one that has never had its settings touched says zero, so none of its
+    // defaults can outrank a choice made anywhere else.
+    function documentSettingTimes(doc) {
+        const times = {};
+        if (!doc || typeof doc !== 'object') return times;
+        const stamped = doc.settingTimes && typeof doc.settingTimes === 'object' && !Array.isArray(doc.settingTimes);
+        const whole = documentSettingsAt(doc);
+        Object.keys(DEFAULT_SETTINGS).forEach(field => {
+            const at = stamped ? parseTimestamp(doc.settingTimes[field]) : whole;
+            if (at) times[field] = at;
+        });
+        return times;
+    }
+
+    // Takes each field from whichever side changed it last. A tie between different values
+    // is settled on the values themselves, so every device and the worker pick the same one.
+    function mergeSettingFields(local, localTimes, remote, remoteTimes) {
+        const result = { settings: { ...local }, times: { ...localTimes }, changed: false, adopted: false };
+        Object.keys(DEFAULT_SETTINGS).forEach(field => {
+            const remoteAt = parseTimestamp(remoteTimes[field]);
+            const localAt = parseTimestamp(localTimes[field]);
+            if (!remoteAt || remoteAt < localAt) return;
+            const remoteValue = JSON.stringify(remote[field]);
+            const localValue = JSON.stringify(local[field]);
+            if (remoteAt === localAt && !(remoteValue > localValue)) return;
+            if (remoteValue !== localValue) {
+                result.settings[field] = remote[field];
+                result.changed = true;
+            }
+            result.times[field] = remoteAt;
+            result.adopted = true;
+        });
+        return result;
+    }
+
+    function newestSettingTime(times) {
+        return Object.values(times).reduce((newest, at) => Math.max(newest, parseTimestamp(at)), 0);
+    }
+
     // Folds the journals into a copy of the main document, keeping the newest of each
     // entry. Removals and horizons are only carried along, not applied: mergeStoredState
     // does that for whoever reads the result.
@@ -365,6 +438,7 @@
             ...base,
             updatedAt: parseTimestamp(base.updatedAt),
             settingsUpdatedAt: main ? documentSettingsAt(base) : 0,
+            settingTimes: main ? documentSettingTimes(base) : {},
             resetAt: parseTimestamp(base.resetAt),
             prunedBefore: parseTimestamp(base.prunedBefore),
             visited: { ...(base.visited && typeof base.visited === 'object' ? base.visited : {}) },
@@ -393,10 +467,16 @@
                     combined.overrideTimes[url] = at;
                 }
             });
-            const settingsAt = parseTimestamp(doc.settingsUpdatedAt);
-            if (doc.settings && typeof doc.settings === 'object' && settingsAt > combined.settingsUpdatedAt) {
-                combined.settings = doc.settings;
-                combined.settingsUpdatedAt = settingsAt;
+            if (doc.settings && typeof doc.settings === 'object') {
+                const merged = mergeSettingFields(
+                    sanitizeSettings(combined.settings), combined.settingTimes,
+                    sanitizeSettings(doc.settings), documentSettingTimes(doc),
+                );
+                if (merged.adopted) {
+                    combined.settings = merged.settings;
+                    combined.settingTimes = merged.times;
+                    combined.settingsUpdatedAt = Math.max(combined.settingsUpdatedAt, newestSettingTime(merged.times));
+                }
             }
         });
         return combined;
@@ -456,6 +536,7 @@
         if (settingsUpdatedAt) {
             journal.settings = { ...settings };
             journal.settingsUpdatedAt = settingsUpdatedAt;
+            journal.settingTimes = { ...settingTimes };
         }
         return journal;
     }
@@ -470,7 +551,7 @@
             || resetAt >= journalSince
             || settingsUpdatedAt >= journalSince;
         if (carries) {
-            await Promise.resolve(GM_setValue(journalKey, journal));
+            await storeValue(journalKey, journal);
             journalWritten = true;
         } else if (journalWritten) {
             // Everything it held has been safely in the main document for a TTL.
@@ -491,7 +572,7 @@
             try {
                 // Its page may have written to it since this save read it; if so it is
                 // left for a later save to merge.
-                const current = await Promise.resolve(GM_getValue(key, null));
+                const current = await loadValue(key);
                 if (current && parseTimestamp(current.writtenAt) !== writtenAt) continue;
                 await Promise.resolve(GM_deleteValue(key));
             } catch (error) {
@@ -506,6 +587,7 @@
             scriptVersion: SCRIPT_VERSION,
             updatedAt: Date.now(),
             settingsUpdatedAt,
+            settingTimes: { ...settingTimes },
             resetAt,
             prunedBefore,
             settings: { ...settings },
@@ -563,13 +645,6 @@
         const remoteReset = parseTimestamp(stored.resetAt);
         const remotePruned = parseTimestamp(stored.prunedBefore);
         const remoteUpdatedAt = parseTimestamp(stored.updatedAt);
-        // A document written before this field existed carries its settings' age in
-        // `updatedAt`; one that carries the field with a zero has never had its settings
-        // touched, and must not be read as "as new as the document" or an untouched device
-        // would push its defaults over everyone else's choices.
-        const remoteSettingsAt = Object.prototype.hasOwnProperty.call(stored, 'settingsUpdatedAt')
-            ? parseTimestamp(stored.settingsUpdatedAt)
-            : remoteUpdatedAt;
         let changed = false;
         let adopted = false;
 
@@ -650,15 +725,20 @@
 
         // Only a document that actually carries settings may replace the local ones: an
         // empty remote store must not reset this device to the defaults.
-        if (adoptSettings && stored.settings && typeof stored.settings === 'object'
-            && remoteSettingsAt > settingsUpdatedAt) {
-            const remoteSettings = sanitizeSettings(stored.settings);
-            if (JSON.stringify(remoteSettings) !== JSON.stringify(settings)) {
-                settings = remoteSettings;
-                changed = true;
+        // Each field is taken on its own, so a device that changed only its tint cannot
+        // hand back its copy of the keywords with it.
+        if (adoptSettings && stored.settings && typeof stored.settings === 'object') {
+            const merged = mergeSettingFields(
+                settings, settingTimes,
+                sanitizeSettings(stored.settings), documentSettingTimes(stored),
+            );
+            if (merged.adopted) {
+                settings = merged.settings;
+                settingTimes = merged.times;
+                settingsUpdatedAt = Math.max(settingsUpdatedAt, newestSettingTime(settingTimes));
+                adopted = true;
+                if (merged.changed) changed = true;
             }
-            settingsUpdatedAt = remoteSettingsAt;
-            adopted = true;
         }
 
         lastKnownUpdatedAt = Math.max(lastKnownUpdatedAt, remoteUpdatedAt);
@@ -687,10 +767,10 @@
                 // The journal goes first: if the page unloads between the two writes, the
                 // journal is the copy that no other tab can overwrite.
                 await writeJournal(payload.updatedAt);
-                await Promise.resolve(GM_setValue(STORAGE_KEY, payload));
+                await storeValue(STORAGE_KEY, payload);
                 // Read back rather than trusting the write: a value that never landed is
                 // exactly the failure that used to go unnoticed until the history was gone.
-                const verified = await Promise.resolve(GM_getValue(STORAGE_KEY, null));
+                const verified = await loadValue(STORAGE_KEY);
                 if (!verified || typeof verified !== 'object'
                     || parseTimestamp(verified.updatedAt) < payload.updatedAt) {
                     throw new Error('Stored state did not come back after writing.');
@@ -982,7 +1062,7 @@
 
     async function readSyncConfig() {
         try {
-            return sanitizeSyncConfig(await Promise.resolve(GM_getValue(SYNC_CONFIG_KEY, null)));
+            return sanitizeSyncConfig(await loadValue(SYNC_CONFIG_KEY));
         } catch (error) {
             console.warn('[JVS] Cloud sync configuration could not be read.', error);
             return { ...DEFAULT_SYNC_CONFIG };
@@ -992,7 +1072,7 @@
     async function writeSyncConfig(next) {
         syncConfig = sanitizeSyncConfig(next);
         try {
-            await Promise.resolve(GM_setValue(SYNC_CONFIG_KEY, { ...syncConfig }));
+            await storeValue(SYNC_CONFIG_KEY, { ...syncConfig });
             return true;
         } catch (error) {
             console.warn('[JVS] Cloud sync configuration could not be saved.', error);
@@ -1157,7 +1237,7 @@
     }
 
     function localMeta() {
-        return { resetAt, prunedBefore, settings: { ...settings }, settingsUpdatedAt };
+        return { resetAt, prunedBefore, settings: { ...settings }, settingsUpdatedAt, settingTimes: { ...settingTimes } };
     }
 
     // Rows come back in the delta shape; turning them into a document lets the merge that
@@ -1189,6 +1269,9 @@
             prunedBefore: safeMeta.prunedBefore,
             settings: safeMeta.settings,
             settingsUpdatedAt: parseTimestamp(safeMeta.settingsUpdatedAt),
+            ...(safeMeta.settingTimes && typeof safeMeta.settingTimes === 'object'
+                ? { settingTimes: safeMeta.settingTimes }
+                : {}),
             visited: visitedRows,
             overrides: overrideRows,
             overrideTimes: overrideTimeRows,
@@ -1943,9 +2026,20 @@
         elements.syncIntervalMinutes.value = syncConfig.intervalMinutes;
     }
 
-    function applySettings(nextSettings, message = 'Settings applied.') {
-        settings = sanitizeSettings(nextSettings);
-        settingsUpdatedAt = Date.now();
+    // Only the fields that actually changed are stamped, unless every one is being set on
+    // purpose (restoring the defaults), so saving the panel after changing one thing does
+    // not claim all the others as this device's newest choice.
+    function stampSettings(next, { all = false } = {}) {
+        const now = Math.max(Date.now(), settingsUpdatedAt + 1);
+        Object.keys(DEFAULT_SETTINGS).forEach(field => {
+            if (all || JSON.stringify(next[field]) !== JSON.stringify(settings[field])) settingTimes[field] = now;
+        });
+        settings = next;
+        settingsUpdatedAt = Math.max(settingsUpdatedAt, newestSettingTime(settingTimes));
+    }
+
+    function applySettings(nextSettings, message = 'Settings applied.', { all = false } = {}) {
+        stampSettings(sanitizeSettings(nextSettings), { all });
         pruneVisited();
         setRootState();
         processAllCards();
@@ -2021,8 +2115,7 @@
             for (const url of restored.keys()) tombstones.delete(tombstoneKey('v', url));
             for (const url of restoredOverrides.keys()) tombstones.delete(tombstoneKey('o', url));
 
-            settings = sanitizeSettings(parsed.settings);
-            settingsUpdatedAt = now;
+            stampSettings(sanitizeSettings(parsed.settings), { all: true });
             visited = restored;
             overrides = restoredOverrides;
             overrideTimes = restoredOverrideTimes;
@@ -2244,7 +2337,7 @@
             applySettings(readSettingsForm());
         });
         shadow.querySelector('.reset').addEventListener('click', () => {
-            applySettings({ ...DEFAULT_SETTINGS }, 'Default settings restored.');
+            applySettings({ ...DEFAULT_SETTINGS }, 'Default settings restored.', { all: true });
         });
         shadow.querySelector('.card-reveal').addEventListener('click', () => toggleCardReveal(selectedCard));
         shadow.querySelector('.card-visited').addEventListener('click', () => {
@@ -2375,7 +2468,7 @@
         let liveSync = false;
         try {
             GM_addValueChangeListener(STORAGE_KEY, (_name, _oldValue, newValue, remote) => {
-                if (remote) reloadRemoteState(newValue);
+                if (remote) reloadRemoteState(decodeValue(newValue, STORAGE_KEY));
             });
             liveSync = true;
         } catch (error) {
@@ -2414,6 +2507,7 @@
         prunedBefore = parseTimestamp(initialState?.prunedBefore);
         lastKnownUpdatedAt = parseTimestamp(initialState?.updatedAt);
         settingsUpdatedAt = parseTimestamp(initialState?.settingsUpdatedAt) || lastKnownUpdatedAt;
+        settingTimes = documentSettingTimes(initialState);
         const replayed = replayPendingVisits();
         pruneVisited();
         await migrateLegacyHistory();

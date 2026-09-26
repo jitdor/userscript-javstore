@@ -234,10 +234,10 @@ test('a visit clobbered between the write and the read-back is replayed', async 
         await write(key, value);
         if (key !== 'javstore_cleanup_state_v2' || !clobbering) return;
         // What another tab holding a pre-click snapshot writes a moment later.
-        const stale = JSON.parse(store.data.get(key));
+        const stale = store.read(key);
         clicked.forEach(url => { delete stale.visited[url]; });
         stale.updatedAt += 1000;
-        store.data.set(key, JSON.stringify(stale));
+        store.write(key, stale);
     };
 
     clickCard(listingTab.window, '/a.html');
@@ -327,7 +327,7 @@ test('a visit a racing write dropped from the main document comes back from the 
     assert.deepEqual(visitedUrls(store), ['https://javstore.net/a.html']);
 
     // Another tab that read before the click writes its document back after it.
-    store.data.set('javstore_cleanup_state_v2', JSON.stringify({ ...before, updatedAt: Date.now() + 1000 }));
+    store.write('javstore_cleanup_state_v2', { ...before, updatedAt: Date.now() + 1000 });
     assert.deepEqual(visitedUrls(store), []);
 
     const reloaded = await openTab(store, { html: listing() });
@@ -349,9 +349,9 @@ test('a journal is retired once it has sat past its TTL, and not before', async 
     await settle();
     assert.ok(store.journals().includes(firstJournal), 'a recent journal is kept');
 
-    const aged = JSON.parse(store.data.get(firstJournal));
+    const aged = store.read(firstJournal);
     aged.writtenAt -= 11 * 60000;
-    store.data.set(firstJournal, JSON.stringify(aged));
+    store.write(firstJournal, aged);
     clickCard(second.window, '/c.html');
     await settle();
     assert.ok(!store.journals().includes(firstJournal), 'the aged journal is retired');
@@ -367,4 +367,23 @@ test('an engine without GM_listValues keeps history in the single document', asy
 
     const reloaded = await openTab(store, { html: listing() });
     assert.ok(card(reloaded.window, '/a.html').classList.contains('jvs-visited'));
+});
+
+test('history an older version stored as a plain object still loads', async () => {
+    const store = makeStore();
+    const at = Date.now() - 60000;
+    store.data.set('javstore_cleanup_state_v2', JSON.stringify({
+        version: 3,
+        updatedAt: at,
+        settingsUpdatedAt: 0,
+        visited: { 'https://javstore.net/a.html': at },
+    }));
+    const tab = await openTab(store, { html: listing() });
+    assert.ok(card(tab.window, '/a.html').classList.contains('jvs-visited'));
+
+    // The next save writes it back in the new encoding without losing anything.
+    clickCard(tab.window, '/b.html');
+    await settle();
+    assert.equal(typeof JSON.parse(store.data.get('javstore_cleanup_state_v2')), 'string');
+    assert.deepEqual(visitedUrls(store), ['https://javstore.net/a.html', 'https://javstore.net/b.html']);
 });

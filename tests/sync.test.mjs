@@ -147,6 +147,92 @@ test('an empty worker does not reset a device to the default settings', async ()
     assert.equal(remote.state().settings.mode, 'hide');
 });
 
+function submitSettings(tab, fields) {
+    const form = tab.shadow().querySelector('form.settings-form');
+    Object.entries(fields).forEach(([name, value]) => { form.elements[name].value = value; });
+    form.dispatchEvent(new tab.window.Event('submit', { bubbles: true, cancelable: true }));
+    return settle();
+}
+
+// Settings used to travel as one blob, newest wins: a new install that changed anything
+// at all before its first sync pushed its default keywords over everyone else's.
+test('a new install that changed one setting does not overwrite the keywords', async () => {
+    const remote = makeRemote();
+    const first = await openDevice(remote);
+    await submitSettings(first, { keywords: 'alpha, beta', excludedKeywords: 'gamma' });
+    await syncNow(first);
+    assert.deepEqual(remote.state().settings.keywords, ['alpha', 'beta']);
+
+    const store = makeStore();
+    const fresh = await openTab(store, { html: listing() });
+    await submitSettings(fresh, { mode: 'blur' });
+    enableSync(store, remote);
+    const second = await openTab(store, { html: listing(), remote });
+    await settle();
+
+    const form = second.shadow().querySelector('form.settings-form');
+    assert.equal(form.elements.keywords.value, 'alpha, beta');
+    assert.equal(form.elements.excludedKeywords.value, 'gamma');
+    assert.equal(form.elements.mode.value, 'blur');
+    assert.deepEqual(remote.state().settings.keywords, ['alpha', 'beta']);
+    assert.deepEqual(remote.state().settings.excludedKeywords, ['gamma']);
+    assert.equal(remote.state().settings.mode, 'blur');
+
+    // And the first device picks up the one change without losing its own.
+    await syncNow(first);
+    const firstForm = first.shadow().querySelector('form.settings-form');
+    assert.equal(firstForm.elements.mode.value, 'blur');
+    assert.equal(firstForm.elements.keywords.value, 'alpha, beta');
+});
+
+test('two devices changing different settings keep both changes', async () => {
+    const remote = makeRemote();
+    const first = await openDevice(remote);
+    const second = await openDevice(remote, { store: makeStore() });
+    await submitSettings(first, { keywords: 'alpha' });
+    await submitSettings(second, { excludedKeywords: 'gamma' });
+    await syncNow(first);
+    await syncNow(second);
+    await syncNow(first);
+
+    for (const tab of [first, second]) {
+        const form = tab.shadow().querySelector('form.settings-form');
+        assert.equal(form.elements.keywords.value, 'alpha');
+        assert.equal(form.elements.excludedKeywords.value, 'gamma');
+    }
+});
+
+// A worker that was holding settings before the per-field stamps has one timestamp for all
+// of them; a device that then changes one setting must not take the rest with it.
+test('settings a worker held from an older version are merged field by field', async () => {
+    const remote = makeRemote();
+    const olderAt = Date.now() - 60000;
+    await remote.handle({
+        method: 'POST',
+        url: remote.endpoint,
+        headers: { Authorization: `Bearer ${remote.token}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+            cursor: 0,
+            changes: [],
+            meta: { settings: { keywords: ['alpha'], excludedKeywords: ['gamma'], mode: 'tint' }, settingsUpdatedAt: olderAt },
+        }),
+    });
+
+    const store = makeStore();
+    const fresh = await openTab(store, { html: listing() });
+    await submitSettings(fresh, { mode: 'hide' });
+    enableSync(store, remote);
+    const device = await openTab(store, { html: listing(), remote });
+    await settle();
+
+    const form = device.shadow().querySelector('form.settings-form');
+    assert.equal(form.elements.keywords.value, 'alpha');
+    assert.equal(form.elements.excludedKeywords.value, 'gamma');
+    assert.equal(form.elements.mode.value, 'hide');
+    assert.deepEqual(remote.state().settings.keywords, ['alpha']);
+    assert.equal(remote.state().settings.mode, 'hide');
+});
+
 test('the endpoint and token never enter the synced document', async () => {
     const remote = makeRemote({ token: 'super-secret-token' });
     const store = makeStore();
@@ -201,13 +287,45 @@ test('sync can be turned on from the panel and is remembered', async () => {
     await settle();
 
     assert.deepEqual(remote.visited(), ['https://javstore.net/a.html']);
-    assert.equal(JSON.parse(store.data.get('javstore_sync_config_v1')).endpoint, remote.endpoint);
+    assert.equal(store.read('javstore_sync_config_v1').endpoint, remote.endpoint);
 
     // A later page load picks the configuration back up on its own.
     const reloaded = await openTab(store, { html: listing(), remote });
     await settle();
     assert.equal(reloaded.shadow().querySelector('form.sync-form').elements.syncEnabled.checked, true);
     assert.match(reloaded.shadow().querySelector('.counts').textContent, /synced/);
+});
+
+// AdGuard for Android keeps only what the GM4 API promises to—strings, numbers, booleans.
+// An object written as-is came back after a reload as "[object Object]", which read as
+// empty storage: the switch turned itself off and everything pulled was gone again.
+test('sync and pulled history survive a reload on storage that keeps only strings', async () => {
+    const remote = makeRemote();
+    const other = await openDevice(remote);
+    clickCard(other.window, '/b.html');
+    await settle();
+    await syncNow(other);
+    assert.deepEqual(remote.visited(), ['https://javstore.net/b.html']);
+
+    const store = makeStore({ primitivesOnly: true });
+    const tab = await openTab(store, { html: listing(), remote });
+    clickCard(tab.window, '/a.html');
+    await settle();
+
+    const form = tab.shadow().querySelector('form.sync-form');
+    form.elements.syncEnabled.checked = true;
+    form.elements.syncEndpoint.value = remote.endpoint;
+    form.elements.syncToken.value = remote.token;
+    form.dispatchEvent(new tab.window.Event('submit', { bubbles: true, cancelable: true }));
+    await settle();
+    assert.ok(card(tab.window, '/b.html').classList.contains('jvs-visited'));
+
+    const reloaded = await openTab(store, { html: listing(), remote });
+    await settle();
+    assert.equal(reloaded.shadow().querySelector('form.sync-form').elements.syncEnabled.checked, true);
+    assert.ok(card(reloaded.window, '/a.html').classList.contains('jvs-visited'));
+    assert.ok(card(reloaded.window, '/b.html').classList.contains('jvs-visited'));
+    assert.deepEqual(visitedUrls(store), ['https://javstore.net/a.html', 'https://javstore.net/b.html']);
 });
 
 test('an http endpoint that is not loopback is refused', async () => {
@@ -262,7 +380,7 @@ test('the cursor does not move past history that could not be saved', async () =
     await settle(600);
     assert.equal(secondStore.state(), null, 'precondition: the history never landed');
     assert.ok(
-        !JSON.parse(secondStore.data.get('javstore_sync_config_v1')).cursor,
+        !secondStore.read('javstore_sync_config_v1').cursor,
         'a cursor recorded here would skip the rows that were lost',
     );
 
@@ -296,7 +414,7 @@ test('a merge that only brings back a tombstone is still saved', async () => {
         secondStore.state().tombstones['v|https://javstore.net/a.html'],
         'the tombstone reached storage',
     );
-    assert.ok(JSON.parse(secondStore.data.get('javstore_sync_config_v1')).cursor > 0);
+    assert.ok(secondStore.read('javstore_sync_config_v1').cursor > 0);
 });
 
 test('pointing the panel at a different worker starts over', async () => {
@@ -312,7 +430,7 @@ test('pointing the panel at a different worker starts over', async () => {
     clickCard(tab.window, '/a.html');
     await settle();
     await syncNow(tab);
-    assert.ok(JSON.parse(store.data.get('javstore_sync_config_v1')).cursor > 0);
+    assert.ok(store.read('javstore_sync_config_v1').cursor > 0);
 
     const form = tab.shadow().querySelector('form.sync-form');
     form.elements.syncEndpoint.value = second.endpoint;
@@ -389,7 +507,7 @@ test('the stored token is not left anywhere the site can read it', async () => {
     tab.shadow().querySelector('form.sync-form')
         .dispatchEvent(new tab.window.Event('submit', { bubbles: true, cancelable: true }));
     await settle();
-    assert.equal(JSON.parse(store.data.get('javstore_sync_config_v1')).token, 'panel-secret');
+    assert.equal(store.read('javstore_sync_config_v1').token, 'panel-secret');
 });
 
 test('a backup taken from the worker imports back into the panel', async () => {
@@ -613,7 +731,7 @@ test('a click replayed from the previous page reaches the worker', async () => {
 
     // What a dropped GM write leaves behind: a click stamped before the last push, which
     // only the next page load in that tab will find.
-    const config = JSON.parse(store.data.get('javstore_sync_config_v1'));
+    const config = store.read('javstore_sync_config_v1');
     const session = new Map([['javstore_pending_visits', JSON.stringify([
         { url: 'https://javstore.net/c.html', at: config.pushedAt - 5000 },
     ])]]);

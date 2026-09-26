@@ -66,6 +66,11 @@ Devices still running 6.2.0 keep working against this worker — it answers the 
 whole-document protocol as well — and a 6.3.0 device falls back to that protocol if it finds
 an old worker, so the two can be upgraded in either order.
 
+Settings merge setting by setting on their own timestamps (`meta.settingTimes`). Settings stored
+by an earlier worker, or sent by a device older than 6.6.0, count as stamped at their single
+`settingsUpdatedAt`. Redeploy the worker when you move to 6.6.0: an older worker still keeps
+whichever device's settings object is newest as a whole.
+
 ## API
 
 Every route requires `Authorization: Bearer <SYNC_TOKEN>`; the path is ignored.
