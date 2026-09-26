@@ -1,5 +1,9 @@
 # Changelog
 
+## 6.5.1
+
+- Fix: on AdGuard for Android, every refresh turned cloud sync off and wiped the history on that device. Setting sync up again pulled everything back and showed it, but the next refresh lost it all again. The script stored its history and sync settings as plain objects, but the GM4 API only promises to keep strings, numbers and booleans. AdGuard for Android sticks to that: while the page stays open it hands the object back, so the check after each save passed, but after a reload the key reads as empty. Every value is now stored as a JSON string and decoded when read. Values an older version stored as objects still load and are rewritten in the new form on the next save. What was already lost on such an engine cannot be recovered, but turning sync on again pulls the worker's copy back.
+
 ## 6.5.0
 
 - Fix: visits could vanish when several tabs saved at the same moment, which is exactly what Ctrl-clicking a row of tiles does: each click saves from the listing and each tab it opens saves again as it loads. Every save reads the whole history, merges, and writes the whole history back, and nothing makes that atomic across tabs, so a slow save built from an older read wrote back a document without a visit another tab had just stored. The merge could not catch it (the visit was never in what that tab read), and neither could the read-back check (the clobbering write really had landed). On a slow storage engine such as AdGuard's this happened often enough to leave gaps in the history, so the tiles already seen were not marked when the listing was reloaded.

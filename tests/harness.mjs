@@ -19,7 +19,12 @@ const openWindows = new Set();
 // random amount up to that many milliseconds, which is what lets saves from several tabs
 // overlap the way they do on a slow engine. `journaling: false` leaves out the two calls
 // the per-page journals need, for engines that do not provide them.
-export function makeStore({ latency = 0, journaling = true } = {}) {
+//
+// `data` holds exactly what GM_setValue was handed (cloned through JSON, the way it
+// survives a reload). `primitivesOnly` is AdGuard for Android, which keeps only what the
+// GM4 API promises to—strings, numbers, booleans—so an object comes back after a reload as
+// "[object Object]". `read` and `write` see through the script's own encoding.
+export function makeStore({ latency = 0, journaling = true, primitivesOnly = false } = {}) {
     const data = new Map();
     const delay = () => (latency ? new Promise(resolve => setTimeout(resolve, Math.random() * latency)) : null);
     return {
@@ -38,7 +43,8 @@ export function makeStore({ latency = 0, journaling = true } = {}) {
             await delay();
             if (this.dropWrites) return;
             if (this.dropStateWrites && key === 'javstore_cleanup_state_v2') return;
-            data.set(key, JSON.stringify(value));
+            const kept = primitivesOnly && value && typeof value === 'object' ? String(value) : value;
+            data.set(key, JSON.stringify(kept));
         },
         async list() {
             await delay();
@@ -49,12 +55,19 @@ export function makeStore({ latency = 0, journaling = true } = {}) {
             if (this.dropWrites) return;
             data.delete(key);
         },
+        read(key) {
+            if (!data.has(key)) return undefined;
+            const value = JSON.parse(data.get(key));
+            return typeof value === 'string' ? JSON.parse(value) : value;
+        },
+        write(key, value) {
+            data.set(key, JSON.stringify(JSON.stringify(value)));
+        },
         journals() {
             return [...data.keys()].filter(key => key.startsWith('javstore_journal_'));
         },
         state() {
-            const raw = data.get('javstore_cleanup_state_v2');
-            return raw ? JSON.parse(raw) : null;
+            return this.read('javstore_cleanup_state_v2') ?? null;
         },
     };
 }
@@ -125,13 +138,13 @@ export function makeRemote({
 }
 
 export function enableSync(store, remote, overrides = {}) {
-    store.data.set('javstore_sync_config_v1', JSON.stringify({
+    store.write('javstore_sync_config_v1', {
         enabled: true,
         endpoint: remote.endpoint,
         token: remote.token,
         intervalMinutes: 5,
         ...overrides,
-    }));
+    });
 }
 
 const cardHtml = (href, title) =>

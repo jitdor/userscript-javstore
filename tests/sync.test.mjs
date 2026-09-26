@@ -201,13 +201,45 @@ test('sync can be turned on from the panel and is remembered', async () => {
     await settle();
 
     assert.deepEqual(remote.visited(), ['https://javstore.net/a.html']);
-    assert.equal(JSON.parse(store.data.get('javstore_sync_config_v1')).endpoint, remote.endpoint);
+    assert.equal(store.read('javstore_sync_config_v1').endpoint, remote.endpoint);
 
     // A later page load picks the configuration back up on its own.
     const reloaded = await openTab(store, { html: listing(), remote });
     await settle();
     assert.equal(reloaded.shadow().querySelector('form.sync-form').elements.syncEnabled.checked, true);
     assert.match(reloaded.shadow().querySelector('.counts').textContent, /synced/);
+});
+
+// AdGuard for Android keeps only what the GM4 API promises to—strings, numbers, booleans.
+// An object written as-is came back after a reload as "[object Object]", which read as
+// empty storage: the switch turned itself off and everything pulled was gone again.
+test('sync and pulled history survive a reload on storage that keeps only strings', async () => {
+    const remote = makeRemote();
+    const other = await openDevice(remote);
+    clickCard(other.window, '/b.html');
+    await settle();
+    await syncNow(other);
+    assert.deepEqual(remote.visited(), ['https://javstore.net/b.html']);
+
+    const store = makeStore({ primitivesOnly: true });
+    const tab = await openTab(store, { html: listing(), remote });
+    clickCard(tab.window, '/a.html');
+    await settle();
+
+    const form = tab.shadow().querySelector('form.sync-form');
+    form.elements.syncEnabled.checked = true;
+    form.elements.syncEndpoint.value = remote.endpoint;
+    form.elements.syncToken.value = remote.token;
+    form.dispatchEvent(new tab.window.Event('submit', { bubbles: true, cancelable: true }));
+    await settle();
+    assert.ok(card(tab.window, '/b.html').classList.contains('jvs-visited'));
+
+    const reloaded = await openTab(store, { html: listing(), remote });
+    await settle();
+    assert.equal(reloaded.shadow().querySelector('form.sync-form').elements.syncEnabled.checked, true);
+    assert.ok(card(reloaded.window, '/a.html').classList.contains('jvs-visited'));
+    assert.ok(card(reloaded.window, '/b.html').classList.contains('jvs-visited'));
+    assert.deepEqual(visitedUrls(store), ['https://javstore.net/a.html', 'https://javstore.net/b.html']);
 });
 
 test('an http endpoint that is not loopback is refused', async () => {
@@ -262,7 +294,7 @@ test('the cursor does not move past history that could not be saved', async () =
     await settle(600);
     assert.equal(secondStore.state(), null, 'precondition: the history never landed');
     assert.ok(
-        !JSON.parse(secondStore.data.get('javstore_sync_config_v1')).cursor,
+        !secondStore.read('javstore_sync_config_v1').cursor,
         'a cursor recorded here would skip the rows that were lost',
     );
 
@@ -296,7 +328,7 @@ test('a merge that only brings back a tombstone is still saved', async () => {
         secondStore.state().tombstones['v|https://javstore.net/a.html'],
         'the tombstone reached storage',
     );
-    assert.ok(JSON.parse(secondStore.data.get('javstore_sync_config_v1')).cursor > 0);
+    assert.ok(secondStore.read('javstore_sync_config_v1').cursor > 0);
 });
 
 test('pointing the panel at a different worker starts over', async () => {
@@ -312,7 +344,7 @@ test('pointing the panel at a different worker starts over', async () => {
     clickCard(tab.window, '/a.html');
     await settle();
     await syncNow(tab);
-    assert.ok(JSON.parse(store.data.get('javstore_sync_config_v1')).cursor > 0);
+    assert.ok(store.read('javstore_sync_config_v1').cursor > 0);
 
     const form = tab.shadow().querySelector('form.sync-form');
     form.elements.syncEndpoint.value = second.endpoint;
@@ -389,7 +421,7 @@ test('the stored token is not left anywhere the site can read it', async () => {
     tab.shadow().querySelector('form.sync-form')
         .dispatchEvent(new tab.window.Event('submit', { bubbles: true, cancelable: true }));
     await settle();
-    assert.equal(JSON.parse(store.data.get('javstore_sync_config_v1')).token, 'panel-secret');
+    assert.equal(store.read('javstore_sync_config_v1').token, 'panel-secret');
 });
 
 test('a backup taken from the worker imports back into the panel', async () => {
@@ -613,7 +645,7 @@ test('a click replayed from the previous page reaches the worker', async () => {
 
     // What a dropped GM write leaves behind: a click stamped before the last push, which
     // only the next page load in that tab will find.
-    const config = JSON.parse(store.data.get('javstore_sync_config_v1'));
+    const config = store.read('javstore_sync_config_v1');
     const session = new Map([['javstore_pending_visits', JSON.stringify([
         { url: 'https://javstore.net/c.html', at: config.pushedAt - 5000 },
     ])]]);

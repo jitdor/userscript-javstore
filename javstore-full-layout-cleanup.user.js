@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         JavStore Full Layout Cleanup - No Sidebars + Mosaic Overlay
 // @namespace    http://tampermonkey.net/
-// @version      6.5.0
+// @version      6.5.1
 // @description  Clean up JavStore's layout, filter keyword-matched thumbnails, and track visited items with private, configurable controls.
 // @homepageURL  https://github.com/jitdor/userscript-javstore
 // @supportURL   https://github.com/jitdor/userscript-javstore/issues
@@ -23,7 +23,7 @@
 (function () {
     'use strict';
 
-    const SCRIPT_VERSION = '6.5.0';
+    const SCRIPT_VERSION = '6.5.1';
     const STORAGE_VERSION = 3;
     const STORAGE_KEY = 'javstore_cleanup_state_v2';
     const LEGACY_STORAGE_KEY = 'javstore_seen_links';
@@ -254,6 +254,35 @@
     // Promise.resolve() handles both without needing to detect which one we're on—but it
     // does mean a plain object is never mistaken for stored state; a Promise passing
     // `typeof === 'object'` unchecked previously made every reload look empty.
+    // Every value goes into storage as a JSON string and is decoded on the way out. The
+    // GM4 API only promises to keep strings, numbers and booleans, and AdGuard for Android
+    // holds to that: an object is handed straight back while the page stays open—so the
+    // read-back after a save passes—but what reaches disk is not the object, and after a
+    // reload the key reads as empty. That took the history and the sync switch with it
+    // on every refresh. Values an older version stored as plain objects still decode.
+    function decodeValue(raw, key) {
+        if (typeof raw === 'string') {
+            try {
+                const parsed = JSON.parse(raw);
+                return parsed && typeof parsed === 'object' ? parsed : null;
+            } catch (error) {
+                // "[object Object]" is what such an engine kept of an object written by an
+                // older version; there is nothing left to recover from it.
+                console.warn(`[JVS] Stored value ${key} could not be decoded.`);
+                return null;
+            }
+        }
+        return raw && typeof raw === 'object' ? raw : null;
+    }
+
+    async function loadValue(key) {
+        return decodeValue(await Promise.resolve(GM_getValue(key, null)), key);
+    }
+
+    function storeValue(key, value) {
+        return Promise.resolve(GM_setValue(key, JSON.stringify(value)));
+    }
+
     async function readStoredState() {
         return combineSnapshot(await readStorageSnapshot());
     }
@@ -285,9 +314,8 @@
     async function readStorageSnapshot() {
         let main = null;
         try {
-            const state = await Promise.resolve(GM_getValue(STORAGE_KEY, null));
+            main = await loadValue(STORAGE_KEY);
             storageAvailable = true;
-            if (state && typeof state === 'object') main = state;
         } catch (error) {
             storageAvailable = false;
             console.warn('[JVS] Isolated storage could not be read.', error);
@@ -337,8 +365,7 @@
             .filter(key => typeof key === 'string' && key.startsWith(JOURNAL_KEY_PREFIX))
             .map(async key => {
                 try {
-                    const doc = await Promise.resolve(GM_getValue(key, null));
-                    return { key, doc: doc && typeof doc === 'object' ? doc : null };
+                    return { key, doc: await loadValue(key) };
                 } catch (error) {
                     // An unreadable journal is skipped for this read; it is retried on the next.
                     return null;
@@ -470,7 +497,7 @@
             || resetAt >= journalSince
             || settingsUpdatedAt >= journalSince;
         if (carries) {
-            await Promise.resolve(GM_setValue(journalKey, journal));
+            await storeValue(journalKey, journal);
             journalWritten = true;
         } else if (journalWritten) {
             // Everything it held has been safely in the main document for a TTL.
@@ -491,7 +518,7 @@
             try {
                 // Its page may have written to it since this save read it; if so it is
                 // left for a later save to merge.
-                const current = await Promise.resolve(GM_getValue(key, null));
+                const current = await loadValue(key);
                 if (current && parseTimestamp(current.writtenAt) !== writtenAt) continue;
                 await Promise.resolve(GM_deleteValue(key));
             } catch (error) {
@@ -687,10 +714,10 @@
                 // The journal goes first: if the page unloads between the two writes, the
                 // journal is the copy that no other tab can overwrite.
                 await writeJournal(payload.updatedAt);
-                await Promise.resolve(GM_setValue(STORAGE_KEY, payload));
+                await storeValue(STORAGE_KEY, payload);
                 // Read back rather than trusting the write: a value that never landed is
                 // exactly the failure that used to go unnoticed until the history was gone.
-                const verified = await Promise.resolve(GM_getValue(STORAGE_KEY, null));
+                const verified = await loadValue(STORAGE_KEY);
                 if (!verified || typeof verified !== 'object'
                     || parseTimestamp(verified.updatedAt) < payload.updatedAt) {
                     throw new Error('Stored state did not come back after writing.');
@@ -982,7 +1009,7 @@
 
     async function readSyncConfig() {
         try {
-            return sanitizeSyncConfig(await Promise.resolve(GM_getValue(SYNC_CONFIG_KEY, null)));
+            return sanitizeSyncConfig(await loadValue(SYNC_CONFIG_KEY));
         } catch (error) {
             console.warn('[JVS] Cloud sync configuration could not be read.', error);
             return { ...DEFAULT_SYNC_CONFIG };
@@ -992,7 +1019,7 @@
     async function writeSyncConfig(next) {
         syncConfig = sanitizeSyncConfig(next);
         try {
-            await Promise.resolve(GM_setValue(SYNC_CONFIG_KEY, { ...syncConfig }));
+            await storeValue(SYNC_CONFIG_KEY, { ...syncConfig });
             return true;
         } catch (error) {
             console.warn('[JVS] Cloud sync configuration could not be saved.', error);
@@ -2375,7 +2402,7 @@
         let liveSync = false;
         try {
             GM_addValueChangeListener(STORAGE_KEY, (_name, _oldValue, newValue, remote) => {
-                if (remote) reloadRemoteState(newValue);
+                if (remote) reloadRemoteState(decodeValue(newValue, STORAGE_KEY));
             });
             liveSync = true;
         } catch (error) {

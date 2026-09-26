@@ -57,7 +57,7 @@ Once it is deployed, open the `JVS` panel → **Cloud sync**, enter the worker U
 - Required userscript APIs: `GM_addStyle`, `GM_getValue`, `GM_setValue`
 - Cloud sync additionally uses `GM_xmlhttpRequest` with `@connect *`, because the worker URL is yours to choose. It is only called once sync is switched on; engines without it fall back to `fetch`, which the worker's CORS headers allow.
 - Optional userscript APIs: `GM_addValueChangeListener` and `GM_registerMenuCommand`. AdGuard does not implement either; the script polls for changes instead of being notified, and its own on-page control replaces the manager menu.
-- `GM_getValue`/`GM_setValue` are supported in both the synchronous Tampermonkey style and the asynchronous GM4 style AdGuard uses.
+- `GM_getValue`/`GM_setValue` are supported in both the synchronous Tampermonkey style and the asynchronous GM4 style AdGuard uses. Values are stored as JSON strings, because GM4 only promises to keep strings, numbers and booleans, and AdGuard for Android drops stored objects when the page reloads.
 - `GM_listValues` and `GM_deleteValue` let each page keep its own journal of what it recorded, so tabs saving at the same moment cannot overwrite each other's visits. AdGuard and Tampermonkey provide both; an engine without them falls back to a single stored document.
 
 The script depends on JavStore's current page structure. If the site changes, please [open an issue](https://github.com/jitdor/userscript-javstore/issues).
