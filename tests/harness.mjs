@@ -186,6 +186,7 @@ export async function openTab(store, {
     referrer = '',
     session = new Map(),
     remote = null,
+    confirm = () => true,
 } = {}) {
     const options = {
         url,
@@ -216,7 +217,7 @@ export async function openTab(store, {
         window.GM_deleteValue = key => store.delete(key);
     }
     window.GM_addStyle = () => {};
-    window.confirm = () => true;
+    window.confirm = confirm;
     if (remote) {
         // A tab may be able to reach more than one worker (the panel can be repointed at a
         // different endpoint), so requests are routed by the URL they were sent to.
