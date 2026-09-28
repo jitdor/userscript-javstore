@@ -57,7 +57,7 @@ test('a visit is pushed without being asked to sync', async () => {
     await waitFor(() => remote.visited().includes('https://javstore.net/b.html'));
 });
 
-test('an item unmarked on one device does not come back from the cloud', async () => {
+test('an item unmarked on one device stays unmarked there and nowhere else', async () => {
     const remote = makeRemote();
     const first = await openDevice(remote);
     clickCard(first.window, '/a.html');
@@ -71,14 +71,15 @@ test('an item unmarked on one device does not come back from the cloud', async (
     pressOnCard(first.window, '/a.html', 'v');
     await settle();
     await syncNow(first);
-    assert.deepEqual(remote.visited(), []);
+    assert.deepEqual(remote.visited(), ['https://javstore.net/a.html'], 'the worker keeps the visit');
+    assert.deepEqual(visitedUrls(first.store), [], 'the worker does not hand it back');
 
     await syncNow(second);
-    assert.deepEqual(visitedUrls(secondStore), []);
-    assert.ok(!card(second.window, '/a.html').classList.contains('jvs-visited'));
+    assert.deepEqual(visitedUrls(secondStore), ['https://javstore.net/a.html']);
+    assert.ok(card(second.window, '/a.html').classList.contains('jvs-visited'));
 });
 
-test('clearing history on one device clears it everywhere', async () => {
+test('clearing history on one device leaves the worker and the other devices alone', async () => {
     const remote = makeRemote();
     const first = await openDevice(remote);
     clickCard(first.window, '/a.html');
@@ -90,13 +91,32 @@ test('clearing history on one device clears it everywhere', async () => {
     const second = await openDevice(remote, { store: secondStore });
     assert.equal(visitedUrls(secondStore).length, 2);
 
+    let asked = '';
+    first.window.confirm = message => { asked = message; return true; };
     first.shadow().querySelector('.clear').click();
     await settle();
+    assert.match(asked, /Only this device is cleared/);
     await syncNow(first);
-    assert.deepEqual(remote.visited(), []);
+    assert.equal(remote.visited().length, 2);
+    assert.deepEqual(visitedUrls(first.store), []);
 
     await syncNow(second);
-    assert.deepEqual(visitedUrls(secondStore), []);
+    assert.equal(visitedUrls(secondStore).length, 2);
+
+    // Neither a reload nor a full download brings the cleared visits back to this device.
+    closeTabs();
+    const store = first.store;
+    store.write('javstore_sync_config_v1', { ...store.read('javstore_sync_config_v1'), cursor: 0 });
+    await openTab(store, { html: listing(), remote });
+    await settle();
+    assert.deepEqual(visitedUrls(store), []);
+
+    // A card visited again afterwards counts, here and everywhere.
+    const again = await openTab(store, { html: listing(), remote });
+    clickCard(again.window, '/a.html');
+    await settle();
+    await syncNow(again);
+    assert.deepEqual(visitedUrls(store), ['https://javstore.net/a.html']);
 });
 
 test('a device that has been offline cannot overwrite what the others recorded', async () => {
@@ -396,25 +416,19 @@ test('the cursor does not move past history that could not be saved', async () =
 
 test('a merge that only brings back a tombstone is still saved', async () => {
     const remote = makeRemote();
-    const first = await openDevice(remote);
-    clickCard(first.window, '/a.html');
-    await settle();
-    await syncNow(first);
-    pressOnCard(first.window, '/a.html', 'v');
-    await settle();
-    await syncNow(first);
+    const url = 'https://javstore.net/a.html';
+    const at = Date.now() - 1000;
+    remote.store.sync({ cursor: 0, changes: [{ kind: 'o', key: url, at, value: 'allow' }] });
+    remote.store.sync({ cursor: 0, changes: [{ kind: 'o', key: url, at: at + 1, deleted: 1 }] });
 
-    // This device has never seen /a.html, so the visit and the deletion that follows it
-    // cancel out: nothing on screen changes, but the tombstone that keeps the visit from
+    // This device has never seen the override, so it and the removal that follows it
+    // cancel out: nothing on screen changes, but the tombstone that keeps the override from
     // coming back has to survive the reload the cursor was recorded for.
     const secondStore = makeStore();
     await openDevice(remote, { store: secondStore });
     await waitFor(() => secondStore.state());
-    assert.deepEqual(visitedUrls(secondStore), []);
-    assert.ok(
-        secondStore.state().tombstones['v|https://javstore.net/a.html'],
-        'the tombstone reached storage',
-    );
+    assert.deepEqual(secondStore.state().overrides, {});
+    assert.ok(secondStore.state().tombstones[`o|${url}`], 'the tombstone reached storage');
     assert.ok(secondStore.read('javstore_sync_config_v1').cursor > 0);
 });
 
@@ -660,7 +674,7 @@ test('the worker refuses a request without the right token', async () => {
     assert.deepEqual(remote.visited(), ['https://javstore.net/a.html']);
 });
 
-test('the worker keeps the newest timestamp and honours tombstones', async () => {
+test('the worker keeps the newest timestamp and ignores visit deletions', async () => {
     const remote = makeRemote();
     const sync = payload => remote.store.sync(payload, 1000);
 
@@ -671,13 +685,44 @@ test('the worker keeps the newest timestamp and honours tombstones', async () =>
             { kind: 'v', key: '/a', at: 400 },
             { kind: 'v', key: '/b', at: 200 },
             { kind: 'v', key: '/c', at: 300 },
-            { kind: 'v', key: '/c', at: 300, deleted: 1 },
+            { kind: 'v', key: '/c', at: 350, deleted: 1 },
+            { kind: 'o', key: '/d', at: 300, value: 'allow' },
+            { kind: 'o', key: '/d', at: 350, deleted: 1 },
         ],
     });
 
     const document = remote.state();
-    assert.deepEqual(document.visited, { '/a': 400, '/b': 500 });
-    assert.equal(document.tombstones['v|/c'], 300);
+    assert.deepEqual(document.visited, { '/a': 400, '/b': 500, '/c': 300 });
+    assert.equal(document.tombstones['v|/c'], undefined);
+    assert.deepEqual(document.overrides, {}, 'removing an override still travels');
+    assert.equal(document.tombstones['o|/d'], 350);
+});
+
+test('no device can clear or prune the worker', async () => {
+    const remote = makeRemote();
+    remote.store.sync({ cursor: 0, changes: [{ kind: 'v', key: '/a', at: 100 }, { kind: 'v', key: '/b', at: 200 }] });
+    const answer = remote.store.sync({ cursor: 0, meta: { resetAt: 5000, prunedBefore: 4000 }, changes: [] });
+
+    assert.deepEqual(remote.state().visited, { '/a': 100, '/b': 200 });
+    assert.equal(answer.meta.resetAt, 0);
+    assert.equal(answer.meta.prunedBefore, 0);
+    assert.equal(remote.state().resetAt, 0);
+
+    // The whole-document exchange of a device on 6.2.0 is held to the same rule.
+    remote.store.applyDocument({ resetAt: 5000, visited: {}, tombstones: { 'v|/a': 6000 } }, 7000);
+    assert.deepEqual(remote.state().visited, { '/a': 100, '/b': 200 });
+});
+
+test('what an older worker stored to delete visits no longer holds them back', async () => {
+    const remote = makeRemote();
+    // A clear, and a tombstone for /b, as a worker before 6.10.0 recorded them.
+    remote.store.sql.exec("INSERT INTO meta (name, value) VALUES ('resetAt', '1000')");
+    remote.store.sql.exec("INSERT INTO meta (name, value) VALUES ('seq', '1')");
+    remote.store.sql.exec("INSERT INTO entries (kind, key, at, deleted, value, seq) VALUES ('v', '/b', 2000, 1, NULL, 1)");
+
+    const answer = remote.store.sync({ cursor: 0, changes: [{ kind: 'v', key: '/a', at: 500 }, { kind: 'v', key: '/b', at: 1500 }] });
+    assert.equal(answer.meta.resetAt, 0, 'the stored clear is not handed to devices');
+    assert.deepEqual(remote.state().visited, { '/a': 500, '/b': 1500 });
 });
 
 test('a device that is behind is told the winning entry it missed', async () => {
@@ -862,7 +907,7 @@ test('an imported backup reaches the other devices', async () => {
     assert.deepEqual(visitedUrls(elsewhere), ['https://javstore.net/a.html']);
 });
 
-test('an import records what it drops so the removal travels too', async () => {
+test('an import drops what it leaves out on the importing device only', async () => {
     const remote = makeRemote();
     const first = await openDevice(remote);
     clickCard(first.window, '/a.html');
@@ -882,7 +927,7 @@ test('an import records what it drops so the removal travels too', async () => {
             text: async () => JSON.stringify({
                 version: 3,
                 updatedAt: at,
-                visited: { 'https://javstore.net/a.html': at },
+                visited: { 'https://javstore.net/a.html': at, 'https://javstore.net/c.html': at },
                 overrides: {},
                 overrideTimes: {},
                 tombstones: {},
@@ -893,9 +938,14 @@ test('an import records what it drops so the removal travels too', async () => {
     await settle();
     await syncNow(second);
 
-    assert.deepEqual(remote.visited(), ['https://javstore.net/a.html']);
+    assert.deepEqual(visitedUrls(secondStore), ['https://javstore.net/a.html', 'https://javstore.net/c.html']);
+    assert.deepEqual(remote.visited(), [
+        'https://javstore.net/a.html', 'https://javstore.net/b.html', 'https://javstore.net/c.html',
+    ]);
     await syncNow(first);
-    assert.deepEqual(visitedUrls(first.store), ['https://javstore.net/a.html']);
+    assert.deepEqual(visitedUrls(first.store), [
+        'https://javstore.net/a.html', 'https://javstore.net/b.html', 'https://javstore.net/c.html',
+    ]);
 });
 
 test('a visit recorded while a sync is in flight is not declared pushed', async () => {

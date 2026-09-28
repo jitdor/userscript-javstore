@@ -1,5 +1,12 @@
 # Changelog
 
+## 6.10.0
+
+- Change: no device can delete visited history from the sync worker any more. The worker used to apply every removal a device sent, and delete the rows outright: one **Clear visited history**, one retention setting above 0, or one import of an older backup on any device wiped those visits from the worker and from every other device, with no way back short of an exported backup. Now the worker only ever adds visits. Clearing history, retention pruning, unmarking a card with `V`, and the entries an import leaves out all apply to the device they happen on, and the worker and the other devices keep their copies. The clear confirmation says so when sync is on.
+- The worker still drops its oldest visits beyond 50,000, which bounds how much storage it uses. Per-card overrides are settings rather than history, so removing one still reaches every device.
+- Visits a device has cleared or unmarked stay hidden on that device even though the worker still holds them. A card visited again later, on any device, shows as visited everywhere again.
+- The worker needs redeploying; the Cloudflare build does that when this reaches `main`. A clear or retention cutoff that an older worker already stored is no longer handed to devices. Visits an older worker already deleted are not restored by this; importing a backup that has them puts them back.
+
 ## 6.9.1
 
 - Fix: a device whose userscript manager lost its visited history but kept its sync settings stayed short of history for good. The panel showed a handful of visits and "synced just now" while the worker still held hundreds. A device remembers how far it has downloaded from the worker, and that bookmark is stored apart from the history. When only the history went, the device kept asking for what was new since the bookmark, so nothing it had lost was ever sent back. The history now carries an id, and the bookmark records which history it belongs to. A history that has lost it (wiped, unreadable, or saved by an older version) is downloaded in full on the next sync, with a "Restored N visited URLs" note, and syncs pick up from the bookmark again after that. Devices updating from 6.9.0 download everything once. Visits recorded since the loss are kept and still go up.
