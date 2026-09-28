@@ -1,5 +1,10 @@
 # Changelog
 
+## 6.9.1
+
+- Fix: a device whose userscript manager lost its visited history but kept its sync settings stayed short of history for good. The panel showed a handful of visits and "synced just now" while the worker still held hundreds. A device remembers how far it has downloaded from the worker, and that bookmark is stored apart from the history. When only the history went, the device kept asking for what was new since the bookmark, so nothing it had lost was ever sent back. The history now carries an id, and the bookmark records which history it belongs to. A history that has lost it (wiped, unreadable, or saved by an older version) is downloaded in full on the next sync, with a "Restored N visited URLs" note, and syncs pick up from the bookmark again after that. Devices updating from 6.9.0 download everything once. Visits recorded since the loss are kept and still go up.
+- Change: the worker's version moves to 6.9.1 with the script. The worker itself is unchanged.
+
 ## 6.9.0
 
 - Change: a worker behind the userscript is now flagged on the page itself with a **⚠ Redeploy worker** button next to the JavStore controls, instead of only in the Cloud sync panel, where it was easy to miss. Tapping it shows both versions and points to the worker's Cloudflare build. The panel still lists the worker version.

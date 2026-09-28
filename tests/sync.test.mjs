@@ -442,6 +442,88 @@ test('pointing the panel at a different worker starts over', async () => {
     assert.deepEqual(second.visited(), ['https://javstore.net/a.html']);
 });
 
+// What a userscript manager leaves behind when it loses the history but keeps the sync
+// settings: the cursor still says every row up to it is already on this device.
+function loseHistory(store) {
+    store.data.delete('javstore_cleanup_state_v2');
+    store.journals().forEach(key => store.data.delete(key));
+}
+
+test('a device that lost its history but kept its cursor downloads it again', async () => {
+    const remote = makeRemote();
+    const store = makeStore();
+    const tab = await openDevice(remote, { store });
+    CARDS.forEach(([href]) => clickCard(tab.window, href));
+    await settle();
+    await syncNow(tab);
+    assert.equal(remote.visited().length, 3);
+    assert.ok(store.read('javstore_sync_config_v1').cursor > 0);
+    closeTabs();
+
+    loseHistory(store);
+    const reopened = await openTab(store, { html: listing(), remote });
+    await waitFor(() => visitedUrls(store).length === 3);
+    assert.ok(card(reopened.window, '/b.html').classList.contains('jvs-visited'));
+    assert.equal(
+        store.read('javstore_sync_config_v1').historyId,
+        store.state().historyId,
+        'the cursor is recorded against the history that now holds the rows',
+    );
+});
+
+test('a visit recorded after the history was lost does not hide what is missing', async () => {
+    const remote = makeRemote();
+    const store = makeStore();
+    const tab = await openDevice(remote, { store });
+    clickCard(tab.window, '/a.html');
+    clickCard(tab.window, '/b.html');
+    await settle();
+    await syncNow(tab);
+    closeTabs();
+
+    // Sync is off for this load, so the new visit is the only history the device has
+    // when it next talks to the worker—the state the device in the report was left in.
+    loseHistory(store);
+    const config = store.read('javstore_sync_config_v1');
+    store.write('javstore_sync_config_v1', { ...config, enabled: false });
+    const offline = await openTab(store, { html: listing(), remote });
+    clickCard(offline.window, '/c.html');
+    await settle();
+    assert.deepEqual(visitedUrls(store), ['https://javstore.net/c.html']);
+    closeTabs();
+
+    store.write('javstore_sync_config_v1', { ...store.read('javstore_sync_config_v1'), enabled: true });
+    await openTab(store, { html: listing(), remote });
+    await waitFor(() => visitedUrls(store).length === 3);
+    assert.equal(remote.visited().length, 3);
+});
+
+test('a device synced by an older version downloads everything once', async () => {
+    const remote = makeRemote();
+    const first = await openDevice(remote);
+    CARDS.forEach(([href]) => clickCard(first.window, href));
+    await settle();
+    await syncNow(first);
+
+    // An older version's device: a cursor past every row, no history id on either side,
+    // and only one of the visits still in its history.
+    const seq = remote.rows().at(-1).seq;
+    const store = makeStore();
+    enableSync(store, remote, { cursor: seq, pushedAt: Date.now(), remoteKey: remote.endpoint });
+    store.write('javstore_cleanup_state_v2', {
+        version: 2,
+        updatedAt: Date.now(),
+        visited: { 'https://javstore.net/a.html': Date.now() - 1000 },
+    });
+    const tab = await openTab(store, { html: listing(), remote });
+    await waitFor(() => visitedUrls(store).length === 3);
+    assert.equal(remote.requests.at(-1).body.cursor, 0);
+
+    // Once the history carries the id, the next sync goes back to asking for what is new.
+    await syncNow(tab);
+    assert.equal(remote.requests.at(-1).body.cursor, seq);
+});
+
 test('only what changed since the last push goes up', async () => {
     const remote = makeRemote();
     const tab = await openDevice(remote);
