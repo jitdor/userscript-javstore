@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         JavStore Full Layout Cleanup - No Sidebars + Mosaic Overlay
 // @namespace    http://tampermonkey.net/
-// @version      6.9.0
+// @version      6.9.1
 // @description  Clean up JavStore's layout, filter keyword-matched thumbnails, and track visited items with private, configurable controls.
 // @homepageURL  https://github.com/jitdor/userscript-javstore
 // @supportURL   https://github.com/jitdor/userscript-javstore/issues
@@ -29,7 +29,7 @@
 (function () {
     'use strict';
 
-    const SCRIPT_VERSION = '6.9.0';
+    const SCRIPT_VERSION = '6.9.1';
     // The same address as @downloadURL: opening it hands the newest release to the
     // userscript manager, which offers to install it.
     const INSTALL_URL = 'https://github.com/jitdor/userscript-javstore/releases/latest/download/javstore-full-layout-cleanup.user.js';
@@ -101,6 +101,8 @@
         cursor: 0,
         pushedAt: 0,
         remoteKey: '',
+        // Which copy of the history the cursor was recorded against; see `historyId`.
+        historyId: '',
     });
 
     const VALID_MODES = new Set(['tint', 'blur', 'hide']);
@@ -114,6 +116,14 @@
     let tombstones = new Map();
     let resetAt = 0;
     let prunedBefore = 0;
+    // Names this device's stored history, and travels inside it. The sync cursor says
+    // "this device already holds every row up to here", which is only true of the history
+    // it was recorded against. The two live under separate storage keys, and a userscript
+    // manager can lose one and keep the other: then the device goes on asking only for
+    // rows after its cursor, and the history it lost is never offered back. The sync
+    // configuration records the id the cursor belongs to, so a history that no longer
+    // carries it—wiped, unreadable, or written before ids existed—is downloaded in full.
+    let historyId = '';
     let settingsUpdatedAt = 0;
     // When each setting was last changed on purpose, keyed by setting name. Settings merge
     // field by field on these, so changing one setting on one device does not carry that
@@ -629,6 +639,7 @@
             settingTimes: { ...settingTimes },
             resetAt,
             prunedBefore,
+            ...(historyId ? { historyId } : {}),
             settings: { ...settings },
             visited: Object.fromEntries(visited),
             overrides: Object.fromEntries(overrides),
@@ -799,7 +810,9 @@
             try {
                 const lowerings = journalLowerings;
                 const snapshot = await readStorageSnapshot();
-                mergeStoredState(combineSnapshot(snapshot));
+                const combined = combineSnapshot(snapshot);
+                adoptHistoryId(combined);
+                mergeStoredState(combined);
                 notePushBacklog();
                 pruneVisited();
                 const payload = serializeState();
@@ -1207,7 +1220,25 @@
             cursor: clamp(candidate.cursor, 0, Number.MAX_SAFE_INTEGER, 0),
             pushedAt: parseTimestamp(candidate.pushedAt),
             remoteKey: String(candidate.remoteKey || '').slice(0, 500),
+            historyId: parseHistoryId(candidate.historyId),
         };
+    }
+
+    function parseHistoryId(value) {
+        return typeof value === 'string' ? value.slice(0, 100) : '';
+    }
+
+    function makeHistoryId() {
+        if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') return crypto.randomUUID();
+        return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
+    }
+
+    // Only ever taken from this device's own storage, never from the worker. What storage
+    // holds wins over what the tab remembers, so a tab opened before the id was made
+    // cannot write the history back without it.
+    function adoptHistoryId(stored) {
+        const id = parseHistoryId(stored?.historyId);
+        if (id) historyId = id;
     }
 
     function syncConfigured() {
@@ -1459,13 +1490,21 @@
             // everything older than now is upstream, a visit another tab recorded is
             // stranded on this device for good. So the stored document is merged in first:
             // what this sync is about to declare pushed, it has now actually seen.
-            applyStoredState(await readStoredState());
+            const stored = await readStoredState();
+            adoptHistoryId(stored);
+            applyStoredState(stored);
             pruneVisited();
 
             // The cursor and the high-water mark only mean anything against the worker they
             // were recorded from, so pointing the panel at a different one starts over.
             const sameRemote = syncConfig.remoteKey === syncConfig.endpoint;
-            let cursor = sameRemote ? syncConfig.cursor : 0;
+            // And the cursor only means anything against the history it was recorded into.
+            // A history that has lost it pulls everything again; the worker settles each row
+            // on its timestamp, so rows the device still holds cost bandwidth and nothing else.
+            const sameHistory = Boolean(historyId) && syncConfig.historyId === historyId;
+            const recovering = sameRemote && syncConfig.cursor > 0 && !sameHistory;
+            const heldBefore = visited.size;
+            let cursor = sameRemote && sameHistory ? syncConfig.cursor : 0;
             const pushedAt = sameRemote ? syncConfig.pushedAt : 0;
 
             let outgoing = localChangesSince(pushedAt);
@@ -1522,8 +1561,12 @@
             // it advanced first and the state write were then interrupted by a navigation or
             // rejected outright, the next sync would ask only for rows after that cursor and
             // the merged ones would never be offered again.
+            // A history without an id gets one now, and it has to be in storage before the
+            // cursor is recorded against it, for the same reason as the rows above.
+            const naming = !legacy && !historyId;
+            if (naming) historyId = makeHistoryId();
             applyingRemoteState = true;
-            const saved = (changed || absorbed) ? await persistState() : true;
+            const saved = (changed || absorbed || naming) ? await persistState() : true;
             applyingRemoteState = false;
             if (!saved) throw new Error('the merged history could not be saved');
 
@@ -1544,11 +1587,16 @@
                 cursor: legacy ? 0 : cursor,
                 pushedAt: legacy ? 0 : Math.min(horizon, unsent || horizon, arrived),
                 remoteKey: legacy ? '' : syncConfig.endpoint,
+                historyId: legacy ? '' : historyId,
             });
 
             lastRemoteSyncAt = Date.now();
             lastRemoteError = '';
-            if (manual) {
+            const restored = visited.size - heldBefore;
+            if (recovering && restored > 0) {
+                console.info(`[JVS] Local history had lost its place in the sync; ${restored} visits were downloaded again.`);
+                showToast(`Restored ${restored} visited URLs from the worker.`);
+            } else if (manual) {
                 // Both directions, because a device that is quietly failing to push looks
                 // exactly like one with nothing to push when only the pull is reported.
                 const report = [];
@@ -2214,6 +2262,7 @@
             cursor: syncConfig.cursor,
             pushedAt: syncConfig.pushedAt,
             remoteKey: syncConfig.remoteKey,
+            historyId: syncConfig.historyId,
             enabled: elements.syncEnabled.checked,
             endpoint: elements.syncEndpoint.value,
             // An empty box means "keep the token already stored"—it is deliberately never
@@ -2650,6 +2699,7 @@
     }
 
     function reloadRemoteState(newValue) {
+        adoptHistoryId(newValue);
         if (applyStoredState(newValue)) showToast('Settings synchronized from another tab.');
     }
 
@@ -2658,7 +2708,9 @@
     // on a snapshot that other tabs have since moved past.
     async function refreshFromStorage() {
         if (document.visibilityState === 'hidden') return;
-        applyStoredState(await readStoredState());
+        const stored = await readStoredState();
+        adoptHistoryId(stored);
+        applyStoredState(stored);
     }
 
     function onReady() {
@@ -2741,6 +2793,7 @@
         tombstones = parseTimestamps(initialState?.tombstones);
         resetAt = parseTimestamp(initialState?.resetAt);
         prunedBefore = parseTimestamp(initialState?.prunedBefore);
+        historyId = parseHistoryId(initialState?.historyId);
         lastKnownUpdatedAt = parseTimestamp(initialState?.updatedAt);
         settingsUpdatedAt = parseTimestamp(initialState?.settingsUpdatedAt) || lastKnownUpdatedAt;
         settingTimes = documentSettingTimes(initialState);
