@@ -103,12 +103,16 @@ panel and flags a worker that is behind it.
 
 A delta `POST` hands over the entries the device has touched since its last push and asks
 for everything recorded after `cursor`. Entries are last-writer-wins on their own event
-timestamp, with a deletion winning a tie; `resetAt` and `prunedBefore` in `meta` are horizons
-below which nothing survives. A device that pushes an entry older than the stored one is
-handed the winner back, so it cannot stay wrong about it.
+timestamp, with a deletion winning a tie. A device that pushes an entry older than the
+stored one is handed the winner back, so it cannot stay wrong about it.
 
-The object keeps up to 50,000 visited entries (a device keeps its newest 5,000) and expires
-tombstones after 90 days.
+Visited history is append-only: the worker ignores a device's visit deletions and its
+`resetAt` and `prunedBefore` horizons (from 6.10.0), and always reports both horizons as 0.
+Clearing history, retention pruning, unmarking a card and a backup import therefore change
+only the device they happen on. Per-card override removals still apply.
+
+The object keeps up to 50,000 visited entries, dropping the oldest beyond that (a device
+keeps its newest 5,000), and expires override tombstones after 90 days.
 
 ## Notes
 

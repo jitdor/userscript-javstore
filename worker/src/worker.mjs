@@ -13,11 +13,17 @@
 //
 // Every entry is last-writer-wins on its own event timestamp, with a deletion winning a tie
 // — the same rule the userscript applies locally, so both sides converge on the same state.
+//
+// Visited history is append-only here: no device can delete it. A cleared history, a
+// retention cutoff, an unmarked card or a backup import that drops entries all stay on the
+// device that did it, and the worker keeps its copy. The only visits that ever leave are
+// the oldest ones beyond MAX_ARCHIVED_VISITS, which bounds the storage the object uses.
+// Per-card overrides are choices rather than history, so removing one still travels.
 
 const STORAGE_VERSION = 3;
 // Reported in every answer so the userscript can show which worker it is talking to. It
 // moves in step with the userscript's own version; a test holds the two together.
-export const WORKER_VERSION = '6.9.1';
+export const WORKER_VERSION = '6.10.0';
 const OBJECT_NAME = 'default';
 const MAX_BODY_BYTES = 8 * 1024 * 1024;
 const MAX_PAGE_ROWS = 2000;
@@ -117,40 +123,24 @@ export class SyncStore {
         return next;
     }
 
-    #horizons() {
-        return {
-            resetAt: timestamp(this.#meta('resetAt', 0)),
-            prunedBefore: timestamp(this.#meta('prunedBefore', 0)),
-        };
-    }
-
+    // A device merges any horizon it is handed and drops every visit stamped before it, so
+    // the worker reports none. One a worker from before 6.10.0 stored is left where it is,
+    // unread, rather than going on clearing each device that syncs.
     #readMeta() {
         return {
-            resetAt: timestamp(this.#meta('resetAt', 0)),
-            prunedBefore: timestamp(this.#meta('prunedBefore', 0)),
+            resetAt: 0,
+            prunedBefore: 0,
             settings: this.#meta('settings', null),
             settingsUpdatedAt: timestamp(this.#meta('settingsUpdatedAt', 0)),
             settingTimes: this.#meta('settingTimes', null),
         };
     }
 
-    // The horizons only ever move forward, and dropping what falls below them is what stops
-    // a device that has been offline from resurrecting a cleared history.
+    // A device's `resetAt` and `prunedBefore` are ignored: clearing history and retention
+    // pruning apply to that device alone, and the archive keeps everything.
     #applyMeta(meta) {
         if (!meta || typeof meta !== 'object') return;
         const current = this.#readMeta();
-
-        const resetAt = timestamp(meta.resetAt);
-        if (resetAt > current.resetAt) {
-            this.#setMeta('resetAt', resetAt);
-            this.sql.exec('DELETE FROM entries WHERE kind = ? AND deleted = 0 AND at <= ?', 'v', resetAt);
-        }
-
-        const prunedBefore = timestamp(meta.prunedBefore);
-        if (prunedBefore > current.prunedBefore) {
-            this.#setMeta('prunedBefore', prunedBefore);
-            this.sql.exec('DELETE FROM entries WHERE kind = ? AND deleted = 0 AND at <= ?', 'v', prunedBefore);
-        }
 
         // Each setting carries its own timestamp, so a device that has never changed one
         // sends a zero for it and can never push its default over another device's choice,
@@ -192,13 +182,15 @@ export class SyncStore {
         const value = kind === 'o' && !deleted ? overrideValue(change.value) : null;
         if (!key || !at) return null;
         if (kind === 'o' && !deleted && !value) return null;
-
-        const { resetAt, prunedBefore } = this.#horizons();
-        if (kind === 'v' && !deleted && (at <= resetAt || at <= prunedBefore)) return null;
+        // A device removing a visit—unmarking a card, or an import that leaves it out—
+        // removes it from that device only.
+        if (kind === 'v' && deleted) return null;
 
         const existing = this.#existing(kind, key);
         if (existing) {
-            const wins = at > existing.at || (at === existing.at && deleted && !existing.deleted);
+            // A visit tombstone a worker from before 6.10.0 stored never outranks a visit.
+            const buried = kind === 'v' && existing.deleted;
+            const wins = buried || at > existing.at || (at === existing.at && deleted && !existing.deleted);
             if (!wins) {
                 const agreed = existing.at === at
                     && Boolean(existing.deleted) === Boolean(deleted)

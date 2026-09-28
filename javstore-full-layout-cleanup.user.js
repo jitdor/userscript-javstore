@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         JavStore Full Layout Cleanup - No Sidebars + Mosaic Overlay
 // @namespace    http://tampermonkey.net/
-// @version      6.9.1
+// @version      6.10.0
 // @description  Clean up JavStore's layout, filter keyword-matched thumbnails, and track visited items with private, configurable controls.
 // @homepageURL  https://github.com/jitdor/userscript-javstore
 // @supportURL   https://github.com/jitdor/userscript-javstore/issues
@@ -29,7 +29,7 @@
 (function () {
     'use strict';
 
-    const SCRIPT_VERSION = '6.9.1';
+    const SCRIPT_VERSION = '6.10.0';
     // The same address as @downloadURL: opening it hands the newest release to the
     // userscript manager, which offers to install it.
     const INSTALL_URL = 'https://github.com/jitdor/userscript-javstore/releases/latest/download/javstore-full-layout-cleanup.user.js';
@@ -2630,7 +2630,11 @@
             importFile.value = '';
         });
         shadow.querySelector('.clear').addEventListener('click', () => {
-            if (!window.confirm(`Clear all ${visited.size} visited URLs? This cannot be undone unless you exported a backup.`)) return;
+            // The worker never deletes visited history, so a clear is this device's alone.
+            const kept = syncConfigured()
+                ? 'Only this device is cleared: your sync worker and other devices keep their copies.'
+                : 'This cannot be undone unless you exported a backup.';
+            if (!window.confirm(`Clear all ${visited.size} visited URLs? ${kept}`)) return;
             resetAt = Date.now();
             visited.clear();
             for (const key of tombstones.keys()) {
