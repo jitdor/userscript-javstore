@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         JavStore Full Layout Cleanup - No Sidebars + Mosaic Overlay
 // @namespace    http://tampermonkey.net/
-// @version      6.10.0
+// @version      6.10.1
 // @description  Clean up JavStore's layout, filter keyword-matched thumbnails, and track visited items with private, configurable controls.
 // @homepageURL  https://github.com/jitdor/userscript-javstore
 // @supportURL   https://github.com/jitdor/userscript-javstore/issues
@@ -29,7 +29,7 @@
 (function () {
     'use strict';
 
-    const SCRIPT_VERSION = '6.10.0';
+    const SCRIPT_VERSION = '6.10.1';
     // The same address as @downloadURL: opening it hands the newest release to the
     // userscript manager, which offers to install it.
     const INSTALL_URL = 'https://github.com/jitdor/userscript-javstore/releases/latest/download/javstore-full-layout-cleanup.user.js';
@@ -1955,7 +1955,29 @@
         return true;
     }
 
+    function repairCardUrl(card) {
+        try {
+            const url = new URL(card.href);
+            // A raw # in an item title can hide the rest of the filename from the
+            // server. Only recover incomplete JavStore item paths, never anchors
+            // on complete pages or hashes belonging to query values.
+            if (!/^https?:$/.test(url.protocol) || url.hostname !== 'javstore.net'
+                || url.search || !/^\/\d+-[^/]+$/.test(url.pathname)
+                || /\.html$/i.test(url.pathname)) return;
+            const match = url.hash.match(/^#([^?]*?-pn\.html)(?=[?#]|$)(.*)$/i);
+            if (!match || match[1].includes('/')) return;
+            // Preserve existing escapes and any real query/fragment after the
+            // recovered filename. Assignment is conditional to avoid observer loops.
+            url.pathname += `%23${match[1].replace(/#/g, '%23')}`;
+            url.hash = '';
+            card.href = url.href + match[2];
+        } catch (error) {
+            // Leave malformed or unsupported links untouched.
+        }
+    }
+
     function processCard(card) {
+        repairCardUrl(card);
         card.classList.add('jvs-card');
         card.classList.remove('jvs-card-match', 'jvs-mode-tint', 'jvs-mode-blur', 'jvs-mode-hide', 'jvs-filtered-out');
         const thumbnail = card.querySelector('.aspect-video');
