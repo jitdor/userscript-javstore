@@ -1,5 +1,12 @@
 # Changelog
 
+## 6.10.1
+
+- Fix: tile links with a literal `#` inside an item filename now encode it as `%23`, so the server receives the complete path instead of returning a 404. This applies to existing tiles and dynamically added or changed tiles, including links opened through the browser's context menu.
+- The repair is limited to incomplete JavStore item paths whose fragment contains the missing `-pn.html` ending. Complete page links, legitimate fragments, query strings, existing escapes, and links to other hosts are preserved.
+- Existing history stored under the correct URL still marks repaired tiles as visited. Older history truncated at `#` is not migrated because the missing portion cannot be recovered reliably.
+- The worker version moves to 6.10.1 with the userscript, as required by the project; worker behavior is unchanged.
+
 ## 6.10.0
 
 - Change: no device can delete visited history from the sync worker any more. The worker used to apply every removal a device sent, and delete the rows outright: one **Clear visited history**, one retention setting above 0, or one import of an older backup on any device wiped those visits from the worker and from every other device, with no way back short of an exported backup. Now the worker only ever adds visits. Clearing history, retention pruning, unmarking a card with `V`, and the entries an import leaves out all apply to the device they happen on, and the worker and the other devices keep their copies. The clear confirmation says so when sync is on.
