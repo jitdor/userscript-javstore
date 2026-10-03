@@ -1,5 +1,12 @@
 # Changelog
 
+## 6.10.2
+
+- Performance: paint visited markers and keyword tinting as soon as the local working copy is read, without waiting for sync configuration, recovery journals, or DOMContentLoaded. Observe newly inserted tiles during page loading too.
+- Read independent storage values in parallel. Reconcile journals before enabling controls or writing history, then refresh the early tile display with recovered settings and visits.
+- Add startup tests for pending sync configuration, pending journal reads, and tiles arriving before DOMContentLoaded.
+- The worker version moves to 6.10.2 with the userscript; worker behavior is unchanged.
+
 ## 6.10.1
 
 - Fix: tile links with a literal `#` inside an item filename now encode it as `%23`, so the server receives the complete path instead of returning a 404. This applies to existing tiles and dynamically added or changed tiles, including links opened through the browser's context menu.

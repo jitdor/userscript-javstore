@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         JavStore Full Layout Cleanup - No Sidebars + Mosaic Overlay
 // @namespace    http://tampermonkey.net/
-// @version      6.10.1
+// @version      6.10.2
 // @description  Clean up JavStore's layout, filter keyword-matched thumbnails, and track visited items with private, configurable controls.
 // @homepageURL  https://github.com/jitdor/userscript-javstore
 // @supportURL   https://github.com/jitdor/userscript-javstore/issues
@@ -29,7 +29,7 @@
 (function () {
     'use strict';
 
-    const SCRIPT_VERSION = '6.10.1';
+    const SCRIPT_VERSION = '6.10.2';
     // The same address as @downloadURL: opening it hands the newest release to the
     // userscript manager, which offers to install it.
     const INSTALL_URL = 'https://github.com/jitdor/userscript-javstore/releases/latest/download/javstore-full-layout-cleanup.user.js';
@@ -365,7 +365,7 @@
         ));
     }
 
-    async function readStorageSnapshot() {
+    async function readMainState() {
         let main = null;
         try {
             main = await loadValue(STORAGE_KEY);
@@ -373,9 +373,14 @@
         } catch (error) {
             storageAvailable = false;
             console.warn('[JVS] Isolated storage could not be read.', error);
-            return { main: null, journals: [] };
+            return null;
         }
-        return { main, journals: await readJournals() };
+        return main;
+    }
+
+    async function readStorageSnapshot() {
+        const [main, journals] = await Promise.all([readMainState(), readJournals()]);
+        return { main, journals };
     }
 
     // ------------------------------------------------------------------
@@ -2139,7 +2144,7 @@
 
     function observeDynamicContent() {
         observer?.disconnect();
-        const root = document.body;
+        const root = document.body || document.documentElement;
         if (!root) return;
         observer = new MutationObserver(mutations => {
             const roots = new Set();
@@ -2808,10 +2813,7 @@
         }
     }
 
-    async function boot() {
-        syncConfig = await readSyncConfig();
-        const snapshot = await readStorageSnapshot();
-        const initialState = combineSnapshot(snapshot);
+    function initializeState(initialState) {
         settings = sanitizeSettings(initialState?.settings);
         visited = parseVisited(initialState?.visited);
         overrides = parseOverrides(initialState?.overrides);
@@ -2823,8 +2825,29 @@
         lastKnownUpdatedAt = parseTimestamp(initialState?.updatedAt);
         settingsUpdatedAt = parseTimestamp(initialState?.settingsUpdatedAt) || lastKnownUpdatedAt;
         settingTimes = documentSettingTimes(initialState);
+    }
+
+    async function boot() {
+        // Start independent reads together. Only the local working copy is needed
+        // to paint tiles; sync configuration and recovery must not hold it up.
+        const configPromise = readSyncConfig();
+        const journalsPromise = readJournals();
+        const main = await readMainState();
+        initializeState(main);
+        setRootState();
+        processAllCards();
+        observeDynamicContent();
+
+        // No writes or controls are enabled during the preview. Reconcile journals
+        // before replay/migration so stale local data cannot overwrite recovery.
+        const [config, journals] = await Promise.all([configPromise, journalsPromise]);
+        syncConfig = config;
+        const snapshot = { main, journals };
+        initializeState(combineSnapshot(snapshot));
         const replayed = replayPendingVisits();
         pruneVisited();
+        setRootState();
+        processAllCards();
         await migrateLegacyHistory();
         if (replayed || journalsAhead(snapshot)) persistState();
         setRootState();

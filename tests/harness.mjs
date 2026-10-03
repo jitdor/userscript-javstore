@@ -191,6 +191,7 @@ export async function openTab(store, {
     session = new Map(),
     remote = null,
     confirm = () => true,
+    beforeRun = () => {},
 } = {}) {
     const options = {
         url,
@@ -267,6 +268,7 @@ export async function openTab(store, {
         };
     }
 
+    beforeRun(window);
     vm.runInContext(source, dom.getInternalVMContext());
     await settle();
     return { dom, window, session, store, shadow: () => window.document.getElementById('jvs-controls-host').shadowRoot };
