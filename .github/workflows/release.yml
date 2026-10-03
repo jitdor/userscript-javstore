@@ -82,6 +82,8 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: '22'
+          cache: npm
+          cache-dependency-path: package.json
 
       # The release asset is the userscript itself, so it ships only if its own suite passes.
       - name: Check userscript syntax
