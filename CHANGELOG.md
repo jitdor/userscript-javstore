@@ -1,5 +1,14 @@
 # Changelog
 
+## 6.11.0
+
+- Share initial cloud sync across a browsing session: page navigation and new tabs reuse locally stored history instead of starting another download. Sessions expire after 30 minutes without startup/sync activity; a new session resumes from the durable cursor.
+- Batch uploads from rapid context-menu browsing, including bursts of 50 tabs. Keep recording every item-page visit while suppressing redundant upload, focus, and periodic requests.
+- Read current shared sync progress before each exchange, coordinate tabs with Web Locks (or an expiring storage lease), and serialize sync settings changes with progress writes.
+- Verify saved sync progress and history identity before marking recovery complete. Failed/incomplete downloads and actual history loss remain recoverable.
+- Add regression coverage for network request counts, downloaded rows, concurrent tabs, session expiry, and failed storage writes. Document session and batching behavior.
+- The worker version moves to 6.11.0 with the userscript; the worker protocol is unchanged.
+
 ## 6.10.2
 
 - Performance: paint visited markers and keyword tinting as soon as the local working copy is read, without waiting for sync configuration, recovery journals, or DOMContentLoaded. Observe newly inserted tiles during page loading too.

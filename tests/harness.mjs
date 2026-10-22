@@ -184,12 +184,15 @@ export function openInNewTabFromContextMenu(window, href) {
     return target;
 }
 
+const deviceLocks = new WeakMap();
+
 export async function openTab(store, {
     html = listingHtml([]),
     url = 'https://javstore.net/',
     referrer = '',
     session = new Map(),
     remote = null,
+    webLocks = true,
     confirm = () => true,
     beforeRun = () => {},
 } = {}) {
@@ -204,6 +207,17 @@ export async function openTab(store, {
     const dom = new JSDOM(html, options);
     const { window } = dom;
     openWindows.add(window);
+    if (webLocks) {
+        // Each store represents an independent device/browser. Its tabs share Web Locks.
+        Object.defineProperty(window.navigator, 'locks', { value: {
+            request(name, callback) {
+                const pending = deviceLocks.get(store) || Promise.resolve();
+                const next = pending.then(callback, callback);
+                deviceLocks.set(store, next.catch(() => {}));
+                return next;
+            },
+        } });
+    }
 
     // sessionStorage belongs to the tab and survives navigation inside it, so the caller
     // hands the same map to the pages that follow one another in a simulated tab.
@@ -275,7 +289,10 @@ export async function openTab(store, {
 }
 
 export function closeTabs() {
-    openWindows.forEach(window => window.close());
+    openWindows.forEach(window => {
+        window.dispatchEvent(new window.Event('pagehide'));
+        window.close();
+    });
     openWindows.clear();
 }
 

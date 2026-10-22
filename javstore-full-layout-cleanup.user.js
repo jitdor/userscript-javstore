@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         JavStore Full Layout Cleanup - No Sidebars + Mosaic Overlay
 // @namespace    http://tampermonkey.net/
-// @version      6.10.2
+// @version      6.11.0
 // @description  Clean up JavStore's layout, filter keyword-matched thumbnails, and track visited items with private, configurable controls.
 // @homepageURL  https://github.com/jitdor/userscript-javstore
 // @supportURL   https://github.com/jitdor/userscript-javstore/issues
@@ -29,7 +29,7 @@
 (function () {
     'use strict';
 
-    const SCRIPT_VERSION = '6.10.2';
+    const SCRIPT_VERSION = '6.11.0';
     // The same address as @downloadURL: opening it hands the newest release to the
     // userscript manager, which offers to install it.
     const INSTALL_URL = 'https://github.com/jitdor/userscript-javstore/releases/latest/download/javstore-full-layout-cleanup.user.js';
@@ -47,6 +47,10 @@
     // document: they are per-device credentials, so they neither travel to the worker nor
     // end up in an exported backup.
     const SYNC_CONFIG_KEY = 'javstore_sync_config_v1';
+    const SYNC_SESSION_KEY = 'javstore_sync_session_v1';
+    const SYNC_LEASE_KEY = 'javstore_sync_lease_v1';
+    const SYNC_SESSION_IDLE_MS = 30 * 60000;
+    const SYNC_LEASE_MS = 90000;
     const MAX_VISITED_ITEMS = 5000;
     const MAX_PENDING_VISITS = 50;
     const MAX_TOMBSTONES = 2000;
@@ -137,6 +141,7 @@
     let syncConfig = { ...DEFAULT_SYNC_CONFIG };
     let remoteQueue = Promise.resolve(false);
     let pendingHorizonWrite = Promise.resolve();
+    let pageClosed = false;
     let remotePushTimer = 0;
     let remotePollTimer = 0;
     let lastRemoteAttemptAt = 0;
@@ -829,7 +834,8 @@
                 // exactly the failure that used to go unnoticed until the history was gone.
                 const verified = await loadValue(STORAGE_KEY);
                 if (!verified || typeof verified !== 'object'
-                    || parseTimestamp(verified.updatedAt) < payload.updatedAt) {
+                    || parseTimestamp(verified.updatedAt) < payload.updatedAt
+                    || (payload.historyId && verified.historyId !== payload.historyId)) {
                     throw new Error('Stored state did not come back after writing.');
                 }
                 lastKnownUpdatedAt = payload.updatedAt;
@@ -1146,7 +1152,7 @@
     }
 
     async function applySyncLink(link) {
-        const saved = await writeSyncConfig({
+        const saved = await saveSyncSettings({
             ...syncConfig,
             enabled: true,
             endpoint: link.endpoint,
@@ -1263,11 +1269,29 @@
         syncConfig = sanitizeSyncConfig(next);
         try {
             await storeValue(SYNC_CONFIG_KEY, { ...syncConfig });
+            const verified = sanitizeSyncConfig(await loadValue(SYNC_CONFIG_KEY));
+            if (JSON.stringify(verified) !== JSON.stringify(syncConfig)) {
+                throw new Error('Sync configuration did not come back after writing.');
+            }
             return true;
         } catch (error) {
             console.warn('[JVS] Cloud sync configuration could not be saved.', error);
             return false;
         }
+    }
+
+    async function saveSyncSettings(next) {
+        return withSyncLock(async () => {
+            const current = await readSyncConfig();
+            return writeSyncConfig({
+                ...current,
+                enabled: next.enabled, endpoint: next.endpoint, token: next.token,
+                intervalMinutes: next.intervalMinutes,
+            });
+        }).catch(error => {
+            console.warn('[JVS] Cloud sync settings could not be saved.', error);
+            return false;
+        });
     }
 
     // GM_xmlhttpRequest is what reaches the worker from a page on another origin, and fetch
@@ -1385,7 +1409,7 @@
         // Persisted through a read-modify-write that can only ever lower the stored
         // value: another tab may have moved it on legitimately in the meantime, and this
         // must not become a way to undo that.
-        pendingHorizonWrite = pendingHorizonWrite.then(async () => {
+        pendingHorizonWrite = pendingHorizonWrite.then(() => withSyncLock(async () => {
             // A sync that ran in the meantime has pushed everything from here anyway, and
             // its horizon is then the authority: dragging it back would only cost a round
             // trip. Anything still holding this value has not been superseded.
@@ -1394,7 +1418,7 @@
             if (stored.remoteKey !== syncConfig.endpoint || !stored.pushedAt) return;
             if (stored.pushedAt <= time) return;
             await writeSyncConfig({ ...stored, pushedAt: time });
-        }, () => {});
+        })).catch(() => {});
     }
 
     // Called after every merge of a document this device stores itself, so that whatever
@@ -1424,6 +1448,12 @@
             if (at >= since) changes.push({ kind: 'o', key: url, at, value });
         }
         return changes.sort((a, b) => a.at - b.at);
+    }
+
+    function metadataSignature() {
+        // settingsUpdatedAt may be synthesized when reading older documents; field
+        // timestamps and values express actual edits without making every tab look dirty.
+        return JSON.stringify({ resetAt, prunedBefore, settings, settingTimes });
     }
 
     function localMeta() {
@@ -1472,13 +1502,73 @@
     // Syncs are queued for the same reason writes are: two overlapping merge cycles would
     // each build on a snapshot the other has already moved past.
     function queueSync(options = {}) {
-        if (!syncConfigured()) return Promise.resolve(false);
-        remoteQueue = remoteQueue.then(() => runSync(options), () => runSync(options));
+        const run = async () => {
+            await pendingHorizonWrite;
+            return withSyncLock(() => runSync(options));
+        };
+        remoteQueue = remoteQueue.then(run, run).catch(error => {
+            lastRemoteError = String(error?.message || 'sync failed');
+            if (options.manual) showToast(`Sync failed: ${lastRemoteError}`, true);
+            return false;
+        });
         return remoteQueue;
     }
 
-    async function runSync({ manual = false } = {}) {
-        if (!syncConfigured()) return false;
+    // Web Locks serialize tabs on this origin and are released automatically on unload.
+    // Older managers/browsers use a short-lived GM lease instead. Its ownership is checked
+    // again before each request and commit; a crashed tab cannot block sync indefinitely.
+    const checkPageOpen = async () => {
+        if (pageClosed) throw new Error('page closed before sync completed');
+    };
+    let checkSyncOwnership = checkPageOpen;
+    async function withSyncLock(action) {
+        if (pageClosed) return false;
+        if (navigator.locks?.request) {
+            return navigator.locks.request('javstore-cloud-sync-v1', async () => {
+                if (pageClosed) return false;
+                return action();
+            });
+        }
+        const owner = makeHistoryId();
+        const pause = ms => new Promise(resolve => window.setTimeout(resolve, ms));
+        const deadline = Date.now() + SYNC_LEASE_MS + 5000;
+        let delay = 100;
+        while (!pageClosed && Date.now() < deadline) {
+            const lease = await loadValue(SYNC_LEASE_KEY);
+            if (lease?.expiresAt > Date.now()) {
+                await pause(delay);
+                delay = Math.min(1000, delay * 2);
+                continue;
+            }
+            await storeValue(SYNC_LEASE_KEY, { owner, expiresAt: Date.now() + SYNC_LEASE_MS });
+            // Let simultaneous claims settle before checking which one actually landed.
+            await pause(50);
+            const claimed = await loadValue(SYNC_LEASE_KEY);
+            if (!claimed) throw new Error('sync coordination could not be saved');
+            if (claimed.owner !== owner) continue;
+            checkSyncOwnership = async () => {
+                if (pageClosed || (await loadValue(SYNC_LEASE_KEY))?.owner !== owner) {
+                    throw new Error('sync ownership changed; retry on the next sync');
+                }
+                await storeValue(SYNC_LEASE_KEY, { owner, expiresAt: Date.now() + SYNC_LEASE_MS });
+            };
+            try {
+                return await action();
+            } finally {
+                checkSyncOwnership = checkPageOpen;
+                if ((await loadValue(SYNC_LEASE_KEY))?.owner === owner) {
+                    await storeValue(SYNC_LEASE_KEY, { owner, expiresAt: 0 });
+                }
+            }
+        }
+        if (!pageClosed) throw new Error('another tab is still syncing; retry shortly');
+        return false;
+    }
+
+    async function runSync({ manual = false, reason = 'push' } = {}) {
+        // Every entry point uses current shared progress, not the tab's boot snapshot.
+        syncConfig = await readSyncConfig();
+        if (!syncConfigured() || pageClosed) return false;
         lastRemoteAttemptAt = Date.now();
         remoteSyncRunning = true;
         scheduleCountUpdate();
@@ -1495,7 +1585,10 @@
             // everything older than now is upstream, a visit another tab recorded is
             // stranded on this device for good. So the stored document is merged in first:
             // what this sync is about to declare pushed, it has now actually seen.
-            const stored = await readStoredState();
+            const snapshot = await readStorageSnapshot();
+            const stored = combineSnapshot(snapshot);
+            const needsCheckpoint = journalsAhead(snapshot);
+            if (!storageAvailable) throw new Error('local history could not be read');
             adoptHistoryId(stored);
             applyStoredState(stored);
             pruneVisited();
@@ -1511,15 +1604,40 @@
             const heldBefore = visited.size;
             let cursor = sameRemote && sameHistory ? syncConfig.cursor : 0;
             const pushedAt = sameRemote ? syncConfig.pushedAt : 0;
+            const session = await loadValue(SYNC_SESSION_KEY);
+            const now = Date.now();
+            const currentSession = session?.endpoint === syncConfig.endpoint
+                && session?.historyId === historyId && sameHistory && sameRemote
+                && session?.completedAt > 0 && now - session.activeAt < SYNC_SESSION_IDLE_MS;
+            if (!manual && currentSession) {
+                const pending = localChangesSince(pushedAt).length
+                    || session.uploadedMeta !== metadataSignature();
+                if (reason === 'startup' && pending) scheduleRemotePush();
+                const fresh = reason === 'startup'
+                    || (reason === 'push' && !pending)
+                    || (reason === 'focus' && now - session.completedAt < REMOTE_REFRESH_MIN_GAP_MS)
+                    || (reason === 'poll' && now - session.completedAt < syncConfig.intervalMinutes * 60000);
+                if (fresh) {
+                    await storeValue(SYNC_SESSION_KEY, { ...session, activeAt: now });
+                    lastRemoteSyncAt = session.completedAt;
+                    remoteWorkerVersion = session.workerVersion || '';
+                    lastRemoteError = '';
+                    return false;
+                }
+            }
 
             let outgoing = localChangesSince(pushedAt);
             let sent = 0;
             let changed = false;
             let absorbed = false;
             let legacy = false;
+            let downloadComplete = false;
+            let uploadedMeta = '';
 
             for (let page = 0; page < MAX_SYNC_PAGES; page += 1) {
                 const batch = outgoing.slice(0, REMOTE_PAGE_ROWS);
+                await checkSyncOwnership();
+                uploadedMeta = metadataSignature();
                 const answer = await requestRemote({
                     client: SCRIPT_VERSION,
                     cursor,
@@ -1536,6 +1654,7 @@
                 // pulling from it without ever pushing.
                 if (answer.state && typeof answer.state === 'object' && answer.cursor === undefined) {
                     legacy = true;
+                    downloadComplete = true;
                     const echoed = await requestRemote({ client: SCRIPT_VERSION, state: serializeState() });
                     const document = echoed?.state && typeof echoed.state === 'object' ? echoed.state : answer.state;
                     if (applyStoredState(document)) changed = true;
@@ -1558,7 +1677,8 @@
                 // already-deleted visit back in.
                 if (lastMergeAdopted) absorbed = true;
                 applyingRemoteState = false;
-                if (!outgoing.length && !answer.more) break;
+                downloadComplete = !answer.more;
+                if (!outgoing.length && downloadComplete) break;
             }
 
             // What was pulled has to be in storage before the cursor is allowed past it.
@@ -1571,7 +1691,7 @@
             const naming = !legacy && !historyId;
             if (naming) historyId = makeHistoryId();
             applyingRemoteState = true;
-            const saved = (changed || absorbed || naming) ? await persistState() : true;
+            const saved = (changed || absorbed || naming || needsCheckpoint) ? await persistState() : true;
             applyingRemoteState = false;
             if (!saved) throw new Error('the merged history could not be saved');
 
@@ -1587,7 +1707,8 @@
             // which pulled the horizon below where the exchange started. That entry was
             // never offered, so the sync cannot claim it.
             const arrived = syncConfig.pushedAt < pushedAt ? syncConfig.pushedAt : horizon;
-            await writeSyncConfig({
+            await checkSyncOwnership();
+            const progressSaved = await writeSyncConfig({
                 ...syncConfig,
                 cursor: legacy ? 0 : cursor,
                 pushedAt: legacy ? 0 : Math.min(horizon, unsent || horizon, arrived),
@@ -1595,6 +1716,15 @@
                 historyId: legacy ? '' : historyId,
             });
 
+            if (!progressSaved) throw new Error('sync progress could not be saved');
+            // Only completed downloads suppress subsequent page-load requests. If the
+            // page budget was exhausted, the next page must continue from the saved cursor.
+            if (downloadComplete) {
+                await storeValue(SYNC_SESSION_KEY, {
+                    endpoint: syncConfig.endpoint, historyId, uploadedMeta, workerVersion: remoteWorkerVersion,
+                    completedAt: Date.now(), activeAt: Date.now(),
+                });
+            }
             lastRemoteSyncAt = Date.now();
             lastRemoteError = '';
             const restored = visited.size - heldBefore;
@@ -1642,14 +1772,16 @@
     function syncOnFocus() {
         if (!syncConfigured()) return;
         if (Date.now() - lastRemoteAttemptAt < REMOTE_REFRESH_MIN_GAP_MS) return;
-        queueSync();
+        queueSync({ reason: 'focus' });
     }
 
     function restartSyncTimer() {
         window.clearInterval(remotePollTimer);
         remotePollTimer = 0;
         if (!syncConfigured()) return;
-        remotePollTimer = window.setInterval(() => queueSync(), syncConfig.intervalMinutes * 60000);
+        remotePollTimer = window.setInterval(() => {
+            if (document.visibilityState !== 'hidden') queueSync({ reason: 'poll' });
+        }, syncConfig.intervalMinutes * 60000);
     }
 
     // Workers from 6.7.0 on name their version. Older ones are told apart by what they send:
@@ -2689,7 +2821,7 @@
                 showToast('Sync needs the access token from your worker.', true);
                 return;
             }
-            const saved = await writeSyncConfig(next);
+            const saved = await saveSyncSettings(next);
             fillSyncForm();
             restartSyncTimer();
             if (!saved) {
@@ -2799,10 +2931,18 @@
 
         restartSyncTimer();
         window.addEventListener('pagehide', () => {
+            pageClosed = true;
             window.clearInterval(remotePollTimer);
             window.clearTimeout(remotePushTimer);
         });
-        queueSync();
+        window.addEventListener('pageshow', event => {
+            if (!event.persisted) return;
+            pageClosed = false;
+            restartSyncTimer();
+            if (!liveSync) syncTimer = window.setInterval(refreshFromStorage, SYNC_POLL_MS);
+            queueSync({ reason: 'startup' });
+        });
+        queueSync({ reason: 'startup' });
         offerPendingSyncLink();
 
         try {
