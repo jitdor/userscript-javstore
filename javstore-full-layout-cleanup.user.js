@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         JavStore Full Layout Cleanup - No Sidebars + Mosaic Overlay
 // @namespace    http://tampermonkey.net/
-// @version      6.11.0
+// @version      6.12.0
 // @description  Clean up JavStore's layout, filter keyword-matched thumbnails, and track visited items with private, configurable controls.
 // @homepageURL  https://github.com/jitdor/userscript-javstore
 // @supportURL   https://github.com/jitdor/userscript-javstore/issues
@@ -29,7 +29,7 @@
 (function () {
     'use strict';
 
-    const SCRIPT_VERSION = '6.11.0';
+    const SCRIPT_VERSION = '6.12.0';
     // The same address as @downloadURL: opening it hands the newest release to the
     // userscript manager, which offers to install it.
     const INSTALL_URL = 'https://github.com/jitdor/userscript-javstore/releases/latest/download/javstore-full-layout-cleanup.user.js';
@@ -38,11 +38,29 @@
     const LEGACY_STORAGE_KEY = 'javstore_seen_links';
     const PENDING_VISITS_KEY = 'javstore_pending_visits';
     // Each page keeps its own journal under this prefix; see "Per-page journals" below.
-    const JOURNAL_KEY_PREFIX = 'javstore_journal_v1_';
-    // How long a journal outlives the last write that could have depended on it. A
-    // read-merge-write cycle takes well under a second even on a slow engine, so this is
-    // generous; it only bounds how many stale journal keys can pile up.
+    // Journals written since 6.12.0 live under this prefix and are each written for a
+    // limited time only (JOURNAL_ROTATE_MS); those under the older prefix were rewritten
+    // for as long as their page stayed open.
+    const JOURNAL_KEY_PREFIX = 'javstore_journal_v2_';
+    const LEGACY_JOURNAL_KEY_PREFIX = 'javstore_journal_v1_';
+    // AdGuard hands each tab the stored values as they were when the tab loaded, and never
+    // shows it what other tabs write afterwards. A tab is trusted to write the shared
+    // history only while what it loaded is younger than FRESH_TAB_MS; past that it writes
+    // its own journal and nothing else. See "Per-page journals" below.
+    const FRESH_TAB_MS = 8 * 60000;
+    // How long a page writes one journal key before starting the next. A key that is no
+    // longer written is final, so any tab that loaded after that holds all of it.
+    const JOURNAL_ROTATE_MS = 5 * 60000;
+    // How long after its last possible write a journal may be removed: by then every tab
+    // that loaded before that write is too old to write the shared history.
     const JOURNAL_TTL_MS = 10 * 60000;
+    // Slack for a write that is still on its way into storage when a tab loads.
+    const STORAGE_SETTLE_MS = 60000;
+    // Journals from before 6.12.0 can still be rewritten by tabs running the older code.
+    const LEGACY_JOURNAL_TTL_MS = 24 * 3600000;
+    // Changes the worker has confirmed stay listed this long, so an older copy that still
+    // lists them as unsent does not offer them again straight away.
+    const OUTBOX_KEEP_MS = 3600000;
     // The sync endpoint and its token are deliberately kept outside the synchronized
     // document: they are per-device credentials, so they neither travel to the worker nor
     // end up in an exported backup.
@@ -51,6 +69,9 @@
     const SYNC_LEASE_KEY = 'javstore_sync_lease_v1';
     const SYNC_SESSION_IDLE_MS = 30 * 60000;
     const SYNC_LEASE_MS = 90000;
+    // The longest one exchange may hold the sync lock. Its requests time out long before;
+    // this is for whatever else could hang, so one stuck tab cannot stop every tab syncing.
+    const SYNC_HOLD_MS = 5 * 60000;
     const MAX_VISITED_ITEMS = 5000;
     const MAX_PENDING_VISITS = 50;
     const MAX_TOMBSTONES = 2000;
@@ -128,6 +149,31 @@
     // configuration records the id the cursor belongs to, so a history that no longer
     // carries it—wiped, unreadable, or written before ids existed—is downloaded in full.
     let historyId = '';
+    // How far into each worker's history this document is complete, keyed by a hash of the
+    // worker's endpoint (the endpoint itself stays out of the history): every row up to
+    // `cursor` is already merged into it. It is saved in the same write as the rows it
+    // describes, so the two cannot disagree. A cursor kept only in the sync configuration
+    // could: an engine that hands each tab the storage it had when the tab loaded (AdGuard
+    // does) lets a long-open tab write back an older history while the configuration still
+    // claims everything up to a later row is on the device.
+    //
+    // `epoch` is the worker's own id for its store, so a worker that comes back empty at
+    // the same address is noticed; `gen` is when this device started counting against
+    // that store, so a position from an earlier start never outranks a later one.
+    let syncedThrough = {};
+    // Changes made on this device that workers have to hear about, keyed `kind|key`: `at`
+    // is the change, `sent` the newest change each worker (by tag) has confirmed, `t` when
+    // the entry last changed. A change is outstanding for a worker while `at` is past what
+    // that worker confirmed. Everything only ever grows, so copies merge by taking the
+    // larger of each, and an older copy can at worst offer a confirmed change once more—
+    // which the worker takes as already known.
+    let outbox = new Map();
+    // Entries this page took on from outside local storage—rows pulled from the worker, a
+    // restored backup—which its journal carries whatever their age, keyed to the journal
+    // key that first carried them. A journal reaching back in time instead would carry
+    // everything stamped since the oldest of them.
+    const journalExtras = new Map();
+    let journalGeneration = 0;
     let settingsUpdatedAt = 0;
     // When each setting was last changed on purpose, keyed by setting name. Settings merge
     // field by field on these, so changing one setting on one device does not carry that
@@ -140,7 +186,6 @@
     let writeQueue = Promise.resolve(false);
     let syncConfig = { ...DEFAULT_SYNC_CONFIG };
     let remoteQueue = Promise.resolve(false);
-    let pendingHorizonWrite = Promise.resolve();
     let pageClosed = false;
     let remotePushTimer = 0;
     let remotePollTimer = 0;
@@ -158,28 +203,34 @@
     // different. That still has to reach storage, so the last merge also records whether it
     // adopted anything at all.
     let lastMergeAdopted = false;
-    // The oldest entry the last merge took on that the push horizon has already moved
-    // past. Such an entry would never be offered to the worker again, so the horizon is
-    // pulled back to it; `mergeStoredState` only reports it, because it also runs while
-    // remote rows are being folded in, where the horizon must not move at all.
-    let lastMergeBackdatedTo = 0;
-    // The oldest timestamp among the entries the last merge took on, whatever the push
-    // horizon: a merge of rows that came from outside local storage has to be carried by
-    // this page's journal back to there.
+    // The oldest timestamp among the entries the last merge took on: a merge of rows that
+    // came from outside local storage has to be carried by this page's journal back to
+    // there.
     let lastMergeOldest = 0;
     // A local change made while a sync was writing could not arm the push timer, because
     // arming it there would have the sync push its own merge straight back. The change
     // still has to go up, so the sync re-arms it once it is done.
     let deferredRemotePush = false;
+    let legacyOutboxSeeded = false;
     let syncTimer = 0;
     let storageAvailable = true;
-    // This page's journal: its key, the oldest timestamp it still has to carry, and the
-    // verified saves that may later let it carry less. See "Per-page journals" below.
-    const journalKey = `${JOURNAL_KEY_PREFIX}${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 10)}`;
+    // When this page loaded, which is when its view of AdGuard's storage was taken.
+    const pageLoadedAt = Date.now();
+    // Whether the userscript manager tells a tab about other tabs' writes. Without that,
+    // a tab's reads are assumed to be the snapshot it loaded with; see FRESH_TAB_MS.
+    const liveStorage = typeof GM_addValueChangeListener === 'function'
+        || (typeof GM === 'object' && GM && typeof GM.addValueChangeListener === 'function');
+    // This page's journal: its current key, when that key was started, and the oldest
+    // timestamp it has to carry. See "Per-page journals" below.
+    const journalToken = Math.random().toString(36).slice(2, 10);
+    let journalCreatedAt = Date.now();
+    let journalKey = makeJournalKey(journalCreatedAt);
     let journalSince = Date.now();
-    let journalCheckpoints = [];
-    let journalLowerings = 0;
     let journalWritten = false;
+    // What this page loaded: the main document and the journals beside it. Only journals
+    // that this already-stored document covers may be removed.
+    let loadedSnapshot = { main: null, journals: [] };
+    const retiredJournals = new Set();
     let observer = null;
     let ui = null;
     let selectedCard = null;
@@ -346,28 +397,56 @@
         return combineSnapshot(await readStorageSnapshot());
     }
 
-    // Whether any journal carries something the main document does not: the trace a
-    // racing write leaves behind, and what the next page load puts back.
-    function journalsAhead({ main, journals }) {
+    // Whether a journal carries something the main document does not: the trace a racing
+    // write, or a tab writing from an older view, leaves behind, and what the next page
+    // load puts back. A journal with nothing ahead of a stored main document is covered by
+    // it, which is what allows the journal to be removed.
+    function journalAhead(doc, main) {
+        if (!doc || typeof doc !== 'object') return false;
         const base = main || {};
         const ahead = (source, target) => Object.entries(source && typeof source === 'object' ? source : {})
             .some(([key, value]) => parseTimestamp(value) > parseTimestamp(target?.[key]));
+        // A full main document dropped its oldest visits to stay under the cap, and a
+        // journal still holding one of those is not ahead of it.
+        const baseVisits = base.visited && typeof base.visited === 'object' ? base.visited : {};
+        let capFloor = 0;
+        if (Object.keys(baseVisits).length >= MAX_VISITED_ITEMS) {
+            capFloor = Math.min(...Object.values(baseVisits).map(parseTimestamp).filter(Boolean));
+        }
         // A visit the main document has since removed, cleared or pruned is not missing.
         const visitAhead = visits => Object.entries(visits && typeof visits === 'object' ? visits : {})
             .some(([url, value]) => {
                 const at = parseTimestamp(value);
-                return at > parseTimestamp(base.visited?.[url])
+                return at > parseTimestamp(baseVisits[url])
                     && at > parseTimestamp(base.tombstones?.[tombstoneKey('v', url)])
                     && at > parseTimestamp(base.resetAt)
-                    && at > parseTimestamp(base.prunedBefore);
+                    && at > parseTimestamp(base.prunedBefore)
+                    && at > capFloor;
             });
-        return journals.some(({ doc }) => doc && (
-            visitAhead(doc.visited)
+        const baseOutbox = parseOutbox(base.outbox);
+        const outboxAhead = [...parseOutbox(doc.outbox)].some(([id, entry]) => {
+            const held = baseOutbox.get(id);
+            // A change already confirmed may have been dropped from the main list.
+            if (!held) return !Object.values(entry.sent).some(mark => mark >= entry.at);
+            return mergedOutboxEntry(held, entry) !== null;
+        });
+        const basePositions = parseSyncPositions(base.syncedThrough);
+        const positionAhead = Object.entries(parseSyncPositions(doc.syncedThrough))
+            .some(([tag, position]) => newerSyncPosition(position, basePositions[tag]) === position
+                && !sameSyncPosition(position, basePositions[tag]));
+        return visitAhead(doc.visited)
             || ahead(doc.tombstones, base.tombstones)
             || ahead(doc.overrideTimes, base.overrideTimes)
             || parseTimestamp(doc.resetAt) > parseTimestamp(base.resetAt)
+            || parseTimestamp(doc.prunedBefore) > parseTimestamp(base.prunedBefore)
+            || ahead(doc.settingTimes, main ? documentSettingTimes(base) : {})
             || parseTimestamp(doc.settingsUpdatedAt) > (main ? documentSettingsAt(base) : 0)
-        ));
+            || outboxAhead
+            || positionAhead;
+    }
+
+    function journalsAhead({ main, journals }) {
+        return journals.some(({ doc }) => journalAhead(doc, main));
     }
 
     async function readMainState() {
@@ -392,23 +471,48 @@
     // Per-page journals
     //
     // The history is one stored value, and every save is a read-merge-write of all of it.
-    // Nothing makes that atomic across tabs: when a burst of Ctrl-clicks opens several
-    // tabs at once, one tab can read the document, another save a visit, and the first
-    // then write back a document without it. The merge cannot help, because the visit was
-    // never in anything the first tab read—and the check after the write passes too,
-    // because the write that clobbered it really did land.
+    // Nothing makes that atomic across tabs, and on AdGuard it is worse than a race: each
+    // tab reads the values storage held when the tab loaded and never sees what other
+    // tabs write afterwards, so a tab that has been open a while writes back the history
+    // as it was then, without whatever every other tab has added since.
     //
-    // So each page also writes what it has recorded to a key of its own, which no other
-    // page ever writes. Every read folds all the journals into the main document, so a
-    // visit that a racing write dropped from the main document comes straight back on the
-    // next read by any tab, and the next save puts it back for good. A journal is removed
-    // by whichever page next saves once it has sat unchanged for JOURNAL_TTL_MS and that
-    // page's own save—which merged it—is verified in place: by then no write that could
-    // have been built without it can still be in flight.
+    // So each page also writes what it has recorded—its own visits and changes, rows it
+    // pulled from the worker, and its place in the sync—to a journal key no other page
+    // writes. Every read folds all the journals into the main document, so whatever a
+    // stale write dropped from the main document comes straight back. Three rules keep
+    // the main document and the journals together holding everything:
+    //
+    // - Without notice of other tabs' writes, only a tab that loaded less than
+    //   FRESH_TAB_MS ago writes the main document. An older one writes its journal only.
+    // - A page writes each journal key for JOURNAL_ROTATE_MS at most and then moves on to
+    //   a new one, so a key that is old enough is final: any tab that loaded later holds
+    //   all of it. A page never removes its own keys; a final key stays in storage until
+    //   the rule below removes it, so the next key only has to overlap it.
+    // - A journal is removed only once it is final, the main document this tab loaded
+    //   from storage already covers it, and JOURNAL_TTL_MS have passed since its last
+    //   write, which leaves no tab that might lack it still allowed to write the main
+    //   document.
     //
     // Engines without GM_listValues or GM_deleteValue cannot find or retire journals, so
     // they keep the single-document behaviour.
     // ------------------------------------------------------------------
+
+    function makeJournalKey(createdAt) {
+        return `${JOURNAL_KEY_PREFIX}${createdAt.toString(36)}_${journalToken}`;
+    }
+
+    // When a journal key was started, from its name, for keys that rotate.
+    function journalCreatedAtOf(key) {
+        if (!key.startsWith(JOURNAL_KEY_PREFIX)) return 0;
+        const created = parseInt(key.slice(JOURNAL_KEY_PREFIX.length).split('_')[0], 36);
+        return Number.isFinite(created) && created > 0 ? created : 0;
+    }
+
+    // Whether this tab is still allowed to write the main document and the sync session:
+    // what it loaded is recent enough that every journal written since is still in storage.
+    function sharedWritesAllowed() {
+        return liveStorage || Date.now() - pageLoadedAt < FRESH_TAB_MS;
+    }
 
     function journalingAvailable() {
         return Boolean(gm.listValues && gm.deleteValue);
@@ -426,7 +530,8 @@
         // Read side by side: on an engine where each call is a round trip, one after
         // another would hold up every page load by the number of open journals.
         const journals = await Promise.all(keys
-            .filter(key => typeof key === 'string' && key.startsWith(JOURNAL_KEY_PREFIX))
+            .filter(key => typeof key === 'string'
+                && (key.startsWith(JOURNAL_KEY_PREFIX) || key.startsWith(LEGACY_JOURNAL_KEY_PREFIX)))
             .map(async key => {
                 try {
                     return { key, doc: await loadValue(key) };
@@ -505,6 +610,8 @@
             overrides: { ...(base.overrides && typeof base.overrides === 'object' ? base.overrides : {}) },
             overrideTimes: { ...(base.overrideTimes && typeof base.overrideTimes === 'object' ? base.overrideTimes : {}) },
         };
+        const outboxes = parseOutbox(base.outbox);
+        const positions = parseSyncPositions(base.syncedThrough);
         const newest = (target, source) => {
             if (!source || typeof source !== 'object') return;
             Object.entries(source).forEach(([key, value]) => {
@@ -516,6 +623,13 @@
             newest(combined.visited, doc.visited);
             newest(combined.tombstones, doc.tombstones);
             combined.resetAt = Math.max(combined.resetAt, parseTimestamp(doc.resetAt));
+            for (const [id, entry] of parseOutbox(doc.outbox)) {
+                const merged = mergedOutboxEntry(outboxes.get(id), entry);
+                if (merged) outboxes.set(id, merged);
+            }
+            Object.entries(parseSyncPositions(doc.syncedThrough)).forEach(([tag, position]) => {
+                positions[tag] = newerSyncPosition(positions[tag], position);
+            });
             combined.prunedBefore = Math.max(combined.prunedBefore, parseTimestamp(doc.prunedBefore));
             const docOverrides = doc.overrides && typeof doc.overrides === 'object' ? doc.overrides : {};
             const docOverrideTimes = doc.overrideTimes && typeof doc.overrideTimes === 'object' ? doc.overrideTimes : {};
@@ -538,36 +652,26 @@
                 }
             }
         });
+        combined.outbox = Object.fromEntries([...outboxes].map(([id, entry]) => [id, serializeOutboxEntry(entry)]));
+        combined.syncedThrough = positions;
         return combined;
     }
 
     // Entries this page adopted with a timestamp from the past—a replayed click, rows
     // pulled from the worker, a restored backup—exist nowhere else in local storage yet,
-    // so the journal has to reach back far enough to carry them.
+    // so the journal has to reach back far enough to carry them. A journal key that has
+    // carried them stays in storage until a newer tab finds them in the main document,
+    // which is what lets later keys leave them out (see writeJournal).
     function lowerJournalSince(at) {
         const time = parseTimestamp(at);
-        if (!time || time >= journalSince) return;
-        journalSince = time;
-        // A checkpoint taken before this entry arrived says nothing about it, and neither
-        // does one from a save that was already under way.
-        journalCheckpoints = [];
-        journalLowerings += 1;
-    }
-
-    // Once a save that covered everything up to some moment has been verified in place for
-    // longer than JOURNAL_TTL_MS, the journal no longer needs to reach back past it.
-    function advanceJournalSince(now) {
-        while (journalCheckpoints.length && now - journalCheckpoints[0].verifiedAt > JOURNAL_TTL_MS) {
-            const { covers } = journalCheckpoints.shift();
-            if (covers >= journalSince) journalSince = covers + 1;
-        }
+        if (time && time < journalSince) journalSince = time;
     }
 
     function serializeJournal(writtenAt) {
-        const pick = source => {
+        const pick = (source, kind = '') => {
             const result = {};
             for (const [key, at] of source) {
-                if (at >= journalSince) result[key] = at;
+                if (at >= journalSince || journalExtras.has(kind ? `${kind}|${key}` : key)) result[key] = at;
             }
             return result;
         };
@@ -575,9 +679,18 @@
         const journalOverrideTimes = {};
         for (const [url, value] of overrides) {
             const at = overrideTimes.get(url) || 0;
-            if (at >= journalSince) {
+            if (at >= journalSince || journalExtras.has(`o|${url}`)) {
                 journalOverrides[url] = value;
                 journalOverrideTimes[url] = at;
+            }
+        }
+        // Only what is still to be sent: a confirmation that never reaches the main
+        // document costs one repeated upload, which the worker takes as already known.
+        const tag = syncConfigured() ? remoteTag(syncConfig.endpoint) : '';
+        const journalOutbox = {};
+        for (const [id, entry] of outbox) {
+            if (entry.t >= journalSince && (!tag || isOutstanding(entry, tag))) {
+                journalOutbox[id] = serializeOutboxEntry(entry);
             }
         }
         const journal = {
@@ -585,10 +698,13 @@
             writtenAt,
             resetAt,
             prunedBefore,
-            visited: pick(visited),
+            visited: pick(visited, 'v'),
             tombstones: pick(tombstones),
             overrides: journalOverrides,
             overrideTimes: journalOverrideTimes,
+            outbox: journalOutbox,
+            // Small, and it only ever describes rows this page holds.
+            syncedThrough: { ...syncedThrough },
         };
         // Settings are one small object, so they always ride along rather than being
         // tracked by where they came from; the newest copy wins when journals are folded.
@@ -601,41 +717,60 @@
     }
 
     async function writeJournal(writtenAt) {
-        if (!journalingAvailable()) return;
-        advanceJournalSince(writtenAt);
+        if (!journalingAvailable()) return null;
+        // A key is named for the moment it is first written, so its name says when it can
+        // last have been written. One written long enough is left as it is, final, and the
+        // page moves to a new key. The old one is not removed here: it stays until a newer
+        // tab finds it in the main document. The new key overlaps it by the span of the
+        // key it replaces—so a last write of the old key that never landed (AdGuard does
+        // not say) is still covered—and leaves anything older to the keys that hold it, so
+        // a long-open page's journal stays as small as its last few minutes.
+        const rotating = journalWritten && writtenAt - journalCreatedAt > JOURNAL_ROTATE_MS;
+        if (rotating) {
+            journalSince = Math.max(journalSince, journalCreatedAt);
+            for (const [id, generation] of journalExtras) {
+                if (generation < journalGeneration) journalExtras.delete(id);
+            }
+            journalGeneration += 1;
+        }
         const journal = serializeJournal(writtenAt);
         const carries = Object.keys(journal.visited).length
             || Object.keys(journal.tombstones).length
             || Object.keys(journal.overrides).length
+            || Object.keys(journal.outbox).length
+            || Object.keys(journal.syncedThrough).length
             || resetAt >= journalSince
             || settingsUpdatedAt >= journalSince;
-        if (carries) {
-            await storeValue(journalKey, journal);
-            journalWritten = true;
-        } else if (journalWritten) {
-            // Everything it held has been safely in the main document for a TTL.
-            await gmCall('deleteValue', journalKey);
-            journalWritten = false;
+        if (!carries) return null;
+        if (!journalWritten || rotating) {
+            journalCreatedAt = writtenAt;
+            journalKey = makeJournalKey(journalCreatedAt);
         }
+        await storeValue(journalKey, journal);
+        journalWritten = true;
+        return journal;
     }
 
-    // Called after this page's save is verified in place: that save merged every journal
-    // in `snapshot`, so any of them that has sat unchanged past the TTL is no longer the
-    // only copy of anything a racing write could still drop.
-    async function retireJournals(snapshot, now) {
-        if (!journalingAvailable()) return;
-        for (const { key, doc } of snapshot.journals) {
-            if (key === journalKey) continue;
-            const writtenAt = parseTimestamp(doc?.writtenAt);
-            if (doc && now - writtenAt <= JOURNAL_TTL_MS) continue;
+    // Removes the journals the main document this tab loaded already covers, once nothing
+    // that lacks them can still be written over the main document.
+    async function retireJournals(now) {
+        if (!journalingAvailable() || !loadedSnapshot.main) return;
+        for (const { key, doc } of loadedSnapshot.journals) {
+            if (key === journalKey || retiredJournals.has(key)) continue;
+            const created = journalCreatedAtOf(key);
+            // The last moment its page could have written it.
+            const closedAt = created
+                ? created + JOURNAL_ROTATE_MS
+                : parseTimestamp(doc?.writtenAt) + LEGACY_JOURNAL_TTL_MS;
+            // Final before this tab loaded, so what it loaded is all of it.
+            if (closedAt + STORAGE_SETTLE_MS > pageLoadedAt) continue;
+            if (now < closedAt + JOURNAL_TTL_MS + STORAGE_SETTLE_MS) continue;
+            if (journalAhead(doc, loadedSnapshot.main)) continue;
+            retiredJournals.add(key);
             try {
-                // Its page may have written to it since this save read it; if so it is
-                // left for a later save to merge.
-                const current = await loadValue(key);
-                if (current && parseTimestamp(current.writtenAt) !== writtenAt) continue;
                 await gmCall('deleteValue', key);
             } catch (error) {
-                // Left in place; the next save tries again.
+                // Left in place; a later page tries again.
             }
         }
     }
@@ -650,6 +785,8 @@
             resetAt,
             prunedBefore,
             ...(historyId ? { historyId } : {}),
+            syncedThrough: { ...syncedThrough },
+            outbox: serializeOutbox(),
             settings: { ...settings },
             visited: Object.fromEntries(visited),
             overrides: Object.fromEntries(overrides),
@@ -669,12 +806,14 @@
     function forgetVisited(url, at = Date.now()) {
         visited.delete(url);
         tombstones.set(tombstoneKey('v', url), at);
+        noteLocalChange('v', url, at);
     }
 
     function forgetOverride(url, at = Date.now()) {
         overrides.delete(url);
         overrideTimes.delete(url);
         tombstones.set(tombstoneKey('o', url), at);
+        noteLocalChange('o', url, at);
     }
 
     // Engines without GM_addValueChangeListener—AdGuard is one—leave every tab holding the
@@ -685,17 +824,12 @@
     // tombstone, or `resetAt` for a full clear) so that merging cannot resurrect them.
     function mergeStoredState(stored, { adoptSettings = false } = {}) {
         lastMergeAdopted = false;
-        lastMergeBackdatedTo = 0;
         lastMergeOldest = 0;
         if (!stored || typeof stored !== 'object') return false;
 
-        // An entry is "backdated" when it is stamped before this device's push horizon:
-        // it was recorded somewhere this device had not looked—another tab, a replayed
-        // click, a restored backup—so the horizon has already swept past it.
+        // The oldest entry this merge takes on, for the journal to reach back to.
         const backdated = at => {
             if (at) lastMergeOldest = lastMergeOldest ? Math.min(lastMergeOldest, at) : at;
-            if (!at || !pushHorizon() || at >= pushHorizon()) return;
-            lastMergeBackdatedTo = lastMergeBackdatedTo ? Math.min(lastMergeBackdatedTo, at) : at;
         };
 
         const remoteVisited = parseVisited(stored.visited);
@@ -801,6 +935,9 @@
             }
         }
 
+        // What other tabs still have to send, and what they have sent.
+        if (mergeOutbox(parseOutbox(stored.outbox))) adopted = true;
+
         lastKnownUpdatedAt = Math.max(lastKnownUpdatedAt, remoteUpdatedAt);
         lastMergeAdopted = adopted || changed;
         return changed;
@@ -808,30 +945,46 @@
 
     // Writes are queued so two read-merge-write cycles can never interleave and drop each
     // other's changes on engines where GM_setValue resolves asynchronously.
-    function persistState() {
-        writeQueue = writeQueue.then(() => writeStoredState(), () => writeStoredState());
-        scheduleRemotePush();
+    function persistState({ journalOnly = false } = {}) {
+        const write = () => writeStoredState({ journalOnly });
+        writeQueue = writeQueue.then(write, write);
+        if (!journalOnly) scheduleRemotePush();
         return writeQueue;
     }
 
-    async function writeStoredState() {
+    // `journalOnly` keeps the main document as it is: for a save that only records what
+    // this page has sent, which no other copy depends on.
+    async function writeStoredState({ journalOnly = false } = {}) {
         const startedAt = Date.now();
         for (let attempt = 0; attempt < 2; attempt += 1) {
             try {
-                const lowerings = journalLowerings;
                 const snapshot = await readStorageSnapshot();
                 const combined = combineSnapshot(snapshot);
                 adoptHistoryId(combined);
+                adoptSyncedThrough(combined);
                 mergeStoredState(combined);
-                notePushBacklog();
                 pruneVisited();
+                const now = Date.now();
+                // A tab whose view of storage may be missing what other tabs have written
+                // since does not write over the shared document; its journal carries its
+                // changes until a newer tab folds them in. Without journals there is
+                // nothing else to write to.
+                const shared = !journalingAvailable() || (!journalOnly && sharedWritesAllowed());
+                const journal = await writeJournal(now);
+                if (!shared) {
+                    lastSavedAt = Date.now();
+                    lastSaveFailed = false;
+                    storageAvailable = true;
+                    if (journal) clearPendingVisits(startedAt, journal);
+                    scheduleCountUpdate();
+                    return true;
+                }
                 const payload = serializeState();
-                // The journal goes first: if the page unloads between the two writes, the
-                // journal is the copy that no other tab can overwrite.
-                await writeJournal(payload.updatedAt);
                 await storeValue(STORAGE_KEY, payload);
-                // Read back rather than trusting the write: a value that never landed is
-                // exactly the failure that used to go unnoticed until the history was gone.
+                // Read back rather than trusting the write: on engines that read storage
+                // itself, a value that never landed is exactly the failure that used to go
+                // unnoticed until the history was gone. (On AdGuard the read comes from the
+                // tab's own copy and proves less, which is why journals carry the rest.)
                 const verified = await loadValue(STORAGE_KEY);
                 if (!verified || typeof verified !== 'object'
                     || parseTimestamp(verified.updatedAt) < payload.updatedAt
@@ -843,11 +996,7 @@
                 lastSaveFailed = false;
                 storageAvailable = true;
                 clearPendingVisits(startedAt, verified);
-                // Only a save still in place when read back vouches for what it merged.
-                if (parseTimestamp(verified.updatedAt) === payload.updatedAt) {
-                    if (lowerings === journalLowerings) journalCheckpoints.push({ verifiedAt: Date.now(), covers: payload.updatedAt });
-                    await retireJournals(snapshot, Date.now());
-                }
+                await retireJournals(Date.now());
                 scheduleCountUpdate();
                 return true;
             } catch (error) {
@@ -949,9 +1098,8 @@
             if (at <= resetAt || at <= prunedBefore || at <= tombstoneTime('v', url)) return;
             if (at <= (visited.get(url) || 0)) return;
             visited.set(url, at);
-            // The click happened before this page loaded, and possibly before the last
-            // push: without pulling the horizon back it would never be offered upstream.
-            lowerPushHorizon(at);
+            noteLocalChange('v', url, at);
+            // The click happened before this page loaded, so the journal has to reach back.
             lowerJournalSince(at);
             changed = true;
         });
@@ -974,6 +1122,7 @@
         if ((visited.get(url) || 0) >= now) return false;
         visited.set(url, now);
         tombstones.delete(tombstoneKey('v', url));
+        noteLocalChange('v', url, now);
         return true;
     }
 
@@ -1021,7 +1170,10 @@
             const entries = JSON.parse(raw);
             if (Array.isArray(entries)) {
                 const migratedAt = Date.now();
-                entries.forEach(url => visited.set(normalizeUrl(url), migratedAt));
+                entries.forEach(url => {
+                    visited.set(normalizeUrl(url), migratedAt);
+                    noteLocalChange('v', normalizeUrl(url), migratedAt);
+                });
                 pruneVisited();
                 if (!(await persistState())) return;
             }
@@ -1055,6 +1207,8 @@
                 .slice(0, visited.size - MAX_VISITED_ITEMS)
                 .forEach(([url]) => visited.delete(url));
         }
+
+        pruneOutbox(now);
 
         // Tombstones only need to outlive the stale snapshots they protect against.
         for (const [key, at] of tombstones) {
@@ -1252,6 +1406,236 @@
         if (id) historyId = id;
     }
 
+    function remoteTag(endpoint) {
+        if (!endpoint) return '';
+        let hash = 0x811c9dc5;
+        for (let index = 0; index < endpoint.length; index += 1) {
+            hash ^= endpoint.charCodeAt(index);
+            hash = Math.imul(hash, 0x01000193) >>> 0;
+        }
+        return hash.toString(16).padStart(8, '0');
+    }
+
+    function parseSyncPosition(value) {
+        if (!value || typeof value !== 'object') return null;
+        const cursor = clamp(value.cursor, 0, Number.MAX_SAFE_INTEGER, 0);
+        const gen = parseTimestamp(value.gen);
+        const epoch = typeof value.epoch === 'string' ? value.epoch.slice(0, 64) : '';
+        return cursor || gen || epoch ? { epoch, gen, cursor } : null;
+    }
+
+    function parseSyncPositions(value) {
+        const result = {};
+        if (!value || typeof value !== 'object' || Array.isArray(value)) return result;
+        // 6.11.1 kept a single position: `{ remote, cursor }`.
+        if (typeof value.remote === 'string') {
+            const cursor = clamp(value.cursor, 0, Number.MAX_SAFE_INTEGER, 0);
+            if (value.remote && cursor) result[value.remote.slice(0, 40)] = { epoch: '', gen: 0, cursor };
+            return result;
+        }
+        Object.entries(value).slice(0, 20).forEach(([tag, position]) => {
+            const parsed = parseSyncPosition(position);
+            if (tag && parsed) result[tag.slice(0, 40)] = parsed;
+        });
+        return result;
+    }
+
+    // A later start against a worker's store outranks an earlier one; within one start, the
+    // further position does.
+    function newerSyncPosition(a, b) {
+        if (!a) return b || null;
+        if (!b) return a;
+        if (a.gen !== b.gen) return a.gen > b.gen ? a : b;
+        if (a.cursor !== b.cursor) return a.cursor > b.cursor ? a : b;
+        // The same place, one copy having learned the store's id since.
+        return a.epoch || !b.epoch ? a : b;
+    }
+
+    function sameSyncPosition(a, b) {
+        return Boolean(a && b) && a.gen === b.gen && a.cursor === b.cursor && a.epoch === b.epoch;
+    }
+
+    // Like the history id, only ever taken from this device's own storage, and only at the
+    // points where a stored document is merged into this tab's: the merged history holds
+    // everything both copies held, so it is complete as far as the further of the two.
+    function adoptSyncedThrough(stored) {
+        Object.entries(parseSyncPositions(stored?.syncedThrough)).forEach(([tag, position]) => {
+            syncedThrough[tag] = newerSyncPosition(syncedThrough[tag], position);
+        });
+    }
+
+    function parseSentMarks(value) {
+        const result = {};
+        if (!value || typeof value !== 'object' || Array.isArray(value)) return result;
+        Object.entries(value).slice(0, 20).forEach(([tag, mark]) => {
+            const at = parseTimestamp(mark);
+            if (tag && at) result[tag.slice(0, 40)] = at;
+        });
+        return result;
+    }
+
+    function parseOutbox(value) {
+        const result = new Map();
+        if (!value || typeof value !== 'object' || Array.isArray(value)) return result;
+        Object.entries(value).forEach(([id, entry]) => {
+            if (!/^[vo]\|./.test(id) || !Array.isArray(entry)) return;
+            const at = parseTimestamp(entry[0]);
+            if (!at) return;
+            result.set(id, { at, sent: parseSentMarks(entry[1]), t: parseTimestamp(entry[2]) || at });
+        });
+        return result;
+    }
+
+    function serializeOutboxEntry(entry) {
+        return [entry.at, { ...entry.sent }, entry.t];
+    }
+
+    function serializeOutbox() {
+        const result = {};
+        for (const [id, entry] of outbox) result[id] = serializeOutboxEntry(entry);
+        return result;
+    }
+
+    // The larger of each part of two copies of one entry; `null` when `entry` adds nothing.
+    function mergedOutboxEntry(held, entry) {
+        if (!held) return { at: entry.at, sent: { ...entry.sent }, t: entry.t };
+        let grew = entry.at > held.at;
+        const sent = { ...held.sent };
+        Object.entries(entry.sent).forEach(([tag, mark]) => {
+            if (mark > (sent[tag] || 0)) {
+                sent[tag] = mark;
+                grew = true;
+            }
+        });
+        return grew ? { at: Math.max(held.at, entry.at), sent, t: Math.max(held.t, entry.t) } : null;
+    }
+
+    function mergeOutbox(source) {
+        let grew = false;
+        for (const [id, entry] of source) {
+            const merged = mergedOutboxEntry(outbox.get(id), entry);
+            if (merged) {
+                outbox.set(id, merged);
+                grew = true;
+            }
+        }
+        return grew;
+    }
+
+    // Every change made on this device goes through here, so the worker hears about it
+    // whichever tab next syncs, however stale the view that tab has of storage.
+    function noteLocalChange(kind, key, at) {
+        if (!key || !at) return;
+        const id = `${kind}|${key}`;
+        const held = outbox.get(id);
+        if (held && held.at >= at) return;
+        outbox.set(id, { at, sent: { ...(held?.sent || {}) }, t: Date.now() });
+    }
+
+    function isOutstanding(entry, tag) {
+        return entry.at > (entry.sent[tag] || 0);
+    }
+
+    // The change the worker should get for an outbox entry, from what this device holds
+    // now. Nothing, when the entry has since been pruned or cleared away here.
+    function outgoingChange(id) {
+        const kind = id.slice(0, 1);
+        const key = id.slice(2);
+        if (kind === 'v') {
+            const at = visited.get(key);
+            if (at) return { kind, key, at };
+        } else if (overrides.has(key)) {
+            return { kind, key, at: overrideTimes.get(key) || 0, value: overrides.get(key) };
+        }
+        const removed = tombstones.get(tombstoneKey(kind, key));
+        return removed ? { kind, key, at: removed, deleted: 1 } : null;
+    }
+
+    function outstandingChanges(tag) {
+        const changes = [];
+        for (const [id, entry] of outbox) {
+            if (!isOutstanding(entry, tag)) continue;
+            const change = outgoingChange(id);
+            if (change) {
+                changes.push({ id, mark: entry.at, change });
+            } else {
+                // Gone here since: nothing to tell the worker.
+                outbox.set(id, { ...entry, sent: { ...entry.sent, [tag]: entry.at }, t: Date.now() });
+            }
+        }
+        return changes.sort((a, b) => a.change.at - b.change.at);
+    }
+
+    function outstandingCount(tag) {
+        let count = 0;
+        for (const entry of outbox.values()) if (isOutstanding(entry, tag)) count += 1;
+        return count;
+    }
+
+    // After downloading a whole store: what it already holds is marked as sent to it, and
+    // what it lacks, or holds an older version of, is listed and returned to send.
+    // Entries listed only so a first upload survives an interrupted sync; once the worker
+    // has confirmed them, no other copy ever listed them, so they go straight away.
+    const reconcileListed = new Set();
+
+    function reconcileWith(pulledAt, tag) {
+        localChangesSince(0).forEach(change => {
+            const id = `${change.kind}|${change.key}`;
+            if ((pulledAt.get(id) || 0) >= change.at) {
+                const held = outbox.get(id);
+                if (held && held.at <= change.at) markSent([{ id, mark: held.at }], tag);
+            } else {
+                if (!outbox.has(id)) reconcileListed.add(id);
+                noteLocalChange(change.kind, change.key, change.at);
+            }
+        });
+        return outstandingChanges(tag);
+    }
+
+    function forgetReconciled(tag) {
+        for (const id of reconcileListed) {
+            const entry = outbox.get(id);
+            if (entry && !isOutstanding(entry, tag)) outbox.delete(id);
+        }
+        reconcileListed.clear();
+    }
+
+    function everythingHeld() {
+        return localChangesSince(0).map(change => ({
+            id: `${change.kind}|${change.key}`,
+            mark: Math.max(change.at, outbox.get(`${change.kind}|${change.key}`)?.at || 0),
+            change,
+        }));
+    }
+
+    function markSent(batch, tag) {
+        const now = Date.now();
+        batch.forEach(({ id, mark }) => {
+            const held = outbox.get(id);
+            if (held && mark > (held.sent[tag] || 0)) {
+                outbox.set(id, { ...held, sent: { ...held.sent, [tag]: mark }, t: now });
+            }
+        });
+    }
+
+    // A confirmed entry stays listed a while for older copies' sake. With sync off nothing
+    // is dropped: the list is bounded by the history itself, and it is what goes up once
+    // sync is back on.
+    function pruneOutbox(now) {
+        const tag = syncConfigured() ? remoteTag(syncConfig.endpoint) : '';
+        if (!tag) return;
+        for (const [id, entry] of outbox) {
+            if (now - entry.t <= OUTBOX_KEEP_MS) continue;
+            if (!isOutstanding(entry, tag) || !outgoingChange(id)) outbox.delete(id);
+        }
+    }
+
+    // Exports and the legacy worker get the history without this device's place in it.
+    function portableState() {
+        const { syncedThrough: _position, outbox: _unsent, ...state } = serializeState();
+        return state;
+    }
+
     function syncConfigured() {
         return syncConfig.enabled && Boolean(syncConfig.endpoint);
     }
@@ -1362,7 +1746,21 @@
         });
     }
 
+    function withTimeout(promise, ms, message) {
+        let timer = 0;
+        const expiry = new Promise((_resolve, reject) => {
+            timer = window.setTimeout(() => reject(remoteFailure(message)), ms);
+        });
+        return Promise.race([promise, expiry]).finally(() => window.clearTimeout(timer));
+    }
+
+    // Each request is bounded on the page's side as well: a fetch has no timeout of its
+    // own, and a manager's request can be dropped without either callback firing.
     function requestRemote(payload) {
+        return withTimeout(sendRemote(payload), REMOTE_TIMEOUT_MS + 5000, 'the worker timed out');
+    }
+
+    function sendRemote(payload) {
         const url = syncConfig.endpoint;
         const headers = {
             'Content-Type': 'application/json',
@@ -1386,54 +1784,9 @@
         });
     }
 
-    // How far this device's pushes have got. Only meaningful against the worker it was
-    // recorded from, so pointing the panel elsewhere reads it as zero.
-    function pushHorizon() {
-        return syncConfig.remoteKey === syncConfig.endpoint ? syncConfig.pushedAt : 0;
-    }
-
-    // The horizon is a wall-clock high-water mark: a sync declares "everything stamped
-    // before now is upstream". That claim is only true of entries the syncing tab could
-    // see, and an entry can reach this device stamped in the past—another tab recorded it
-    // while this one was not looking, a click was replayed from the previous page, a
-    // backup was restored. Such an entry is behind the horizon the moment it arrives and
-    // would never be offered again, which is how a visit ends up on one device for good.
-    // So the horizon is pulled back to it, and the next sync rescans from there. The cost
-    // is re-offering a few entries the worker already has, which it discards on arrival.
-    function lowerPushHorizon(at) {
-        const time = parseTimestamp(at);
-        if (!syncConfigured() || !time) return;
-        const horizon = pushHorizon();
-        if (!horizon || time >= horizon) return;
-        syncConfig = { ...syncConfig, pushedAt: time };
-        // Persisted through a read-modify-write that can only ever lower the stored
-        // value: another tab may have moved it on legitimately in the meantime, and this
-        // must not become a way to undo that.
-        pendingHorizonWrite = pendingHorizonWrite.then(() => withSyncLock(async () => {
-            // A sync that ran in the meantime has pushed everything from here anyway, and
-            // its horizon is then the authority: dragging it back would only cost a round
-            // trip. Anything still holding this value has not been superseded.
-            if (syncConfig.pushedAt !== time) return;
-            const stored = await readSyncConfig();
-            if (stored.remoteKey !== syncConfig.endpoint || !stored.pushedAt) return;
-            if (stored.pushedAt <= time) return;
-            await writeSyncConfig({ ...stored, pushedAt: time });
-        })).catch(() => {});
-    }
-
-    // Called after every merge of a document this device stores itself, so that whatever
-    // the merge took on from another tab is pushed rather than silently swallowed. Remote
-    // rows are excluded: they came from the worker, so re-offering them is pure waste.
-    function notePushBacklog() {
-        const at = lastMergeBackdatedTo;
-        lastMergeBackdatedTo = 0;
-        if (at && !applyingRemoteState) lowerPushHorizon(at);
-    }
-
-    // The entries this device has touched since its last successful push. Everything
-    // recorded locally is stamped with the current time, so a single high-water mark is
-    // enough to find them—and entries that arrived from the worker are always older than
-    // it, so they are never sent straight back.
+    // The entries stamped at or after `since`. Before 6.12.0 a device tracked what it had
+    // pushed as one such moment, kept in the sync configuration; a history saved by then
+    // seeds its outbox from it once.
     function localChangesSince(since) {
         const changes = [];
         for (const [url, at] of visited) {
@@ -1502,10 +1855,7 @@
     // Syncs are queued for the same reason writes are: two overlapping merge cycles would
     // each build on a snapshot the other has already moved past.
     function queueSync(options = {}) {
-        const run = async () => {
-            await pendingHorizonWrite;
-            return withSyncLock(() => runSync(options));
-        };
+        const run = () => withSyncLock(() => runSync(options));
         remoteQueue = remoteQueue.then(run, run).catch(error => {
             lastRemoteError = String(error?.message || 'sync failed');
             if (options.manual) showToast(`Sync failed: ${lastRemoteError}`, true);
@@ -1523,12 +1873,20 @@
     let checkSyncOwnership = checkPageOpen;
     async function withSyncLock(action) {
         if (pageClosed) return false;
+        // However an exchange gets stuck, it gives the lock up in the end, so one hung tab
+        // cannot stop every other tab from syncing. Its requests time out well before.
+        const bounded = () => withTimeout(action(), SYNC_HOLD_MS, 'the sync took too long');
         if (navigator.locks?.request) {
             return navigator.locks.request('javstore-cloud-sync-v1', async () => {
                 if (pageClosed) return false;
-                return action();
+                return bounded();
             });
         }
+        // A lease kept in storage only excludes anything where tabs read each other's
+        // writes. Where each tab reads its own copy (AdGuard), every tab would see its own
+        // claim and win, and a lease taken before a tab loaded would hold it up for the
+        // whole lease; two tabs syncing at once cost a duplicate request and nothing more.
+        if (!liveStorage) return bounded();
         const owner = makeHistoryId();
         const pause = ms => new Promise(resolve => window.setTimeout(resolve, ms));
         const deadline = Date.now() + SYNC_LEASE_MS + 5000;
@@ -1553,7 +1911,7 @@
                 await storeValue(SYNC_LEASE_KEY, { owner, expiresAt: Date.now() + SYNC_LEASE_MS });
             };
             try {
-                return await action();
+                return await bounded();
             } finally {
                 checkSyncOwnership = checkPageOpen;
                 if ((await loadValue(SYNC_LEASE_KEY))?.owner === owner) {
@@ -1566,7 +1924,7 @@
     }
 
     async function runSync({ manual = false, reason = 'push' } = {}) {
-        // Every entry point uses current shared progress, not the tab's boot snapshot.
+        // Every entry point uses the current sync settings, not the tab's boot snapshot.
         syncConfig = await readSyncConfig();
         if (!syncConfigured() || pageClosed) return false;
         lastRemoteAttemptAt = Date.now();
@@ -1576,49 +1934,61 @@
             // Let any local write finish first so what gets pushed is the current state.
             await writeQueue.catch(() => false);
 
-            // Read before the horizon is taken, so nothing recorded between the two can
-            // fall into the gap.
-            const horizon = Date.now();
-            // Sibling tabs keep their own copy of the document and only write it to
-            // storage; nothing tells this one that they have. Pushing from memory alone is
-            // therefore pushing a stale document, and since the horizon afterwards claims
-            // everything older than now is upstream, a visit another tab recorded is
-            // stranded on this device for good. So the stored document is merged in first:
-            // what this sync is about to declare pushed, it has now actually seen.
+            // Whatever the stored document and the journals hold is merged in first: what
+            // other tabs recorded and still have to send, and how far they have got.
             const snapshot = await readStorageSnapshot();
             const stored = combineSnapshot(snapshot);
             const needsCheckpoint = journalsAhead(snapshot);
             if (!storageAvailable) throw new Error('local history could not be read');
             adoptHistoryId(stored);
+            adoptSyncedThrough(stored);
             applyStoredState(stored);
             pruneVisited();
 
-            // The cursor and the high-water mark only mean anything against the worker they
-            // were recorded from, so pointing the panel at a different one starts over.
-            const sameRemote = syncConfig.remoteKey === syncConfig.endpoint;
-            // And the cursor only means anything against the history it was recorded into.
-            // A history that has lost it pulls everything again; the worker settles each row
-            // on its timestamp, so rows the device still holds cost bandwidth and nothing else.
-            const sameHistory = Boolean(historyId) && syncConfig.historyId === historyId;
-            const recovering = sameRemote && syncConfig.cursor > 0 && !sameHistory;
-            const heldBefore = visited.size;
-            let cursor = sameRemote && sameHistory ? syncConfig.cursor : 0;
-            const pushedAt = sameRemote ? syncConfig.pushedAt : 0;
+            // Only a tab whose view of storage is recent writes the main document and the
+            // sync session; an older one still syncs, and its journal carries the result.
+            const shared = sharedWritesAllowed();
+            const tag = remoteTag(syncConfig.endpoint);
+            // Where this history is complete up to on this worker, as the history itself
+            // records it. None: never synced with this worker, or the history was lost.
+            let position = syncedThrough[tag] || null;
+            const hadPosition = Boolean(position);
             const session = await loadValue(SYNC_SESSION_KEY);
+            // Whether this device has synced with this worker before; a history with no
+            // place in it then is one that was lost, which is worth saying.
+            const syncedBefore = session?.endpoint === syncConfig.endpoint
+                || (syncConfig.remoteKey === syncConfig.endpoint && syncConfig.cursor > 0);
+            // A history saved before 6.12.0 lists nothing as unsent: what it had not
+            // pushed is what the configuration's old horizon had not passed.
+            if (position && !legacyOutboxSeeded && snapshot.main && snapshot.main.outbox === undefined) {
+                legacyOutboxSeeded = true;
+                const since = syncConfig.remoteKey === syncConfig.endpoint ? syncConfig.pushedAt : 0;
+                localChangesSince(since).forEach(change => noteLocalChange(change.kind, change.key, change.at));
+            }
+            const heldBefore = visited.size;
+            let cursor = position?.cursor || 0;
             const now = Date.now();
-            const currentSession = session?.endpoint === syncConfig.endpoint
-                && session?.historyId === historyId && sameHistory && sameRemote
+            // The session only vouches for a history that still reaches as far as the
+            // download it records; one written back from an older copy has to catch up.
+            // A worker that only exchanges whole documents keeps no place to resume from.
+            const currentSession = position && position.epoch !== 'document'
+                && session?.endpoint === syncConfig.endpoint
+                && Number.isFinite(session?.cursor) && session.gen === position.gen && cursor >= session.cursor
                 && session?.completedAt > 0 && now - session.activeAt < SYNC_SESSION_IDLE_MS;
             if (!manual && currentSession) {
-                const pending = localChangesSince(pushedAt).length
-                    || session.uploadedMeta !== metadataSignature();
+                const pending = outstandingCount(tag) || session.uploadedMeta !== metadataSignature();
                 if (reason === 'startup' && pending) scheduleRemotePush();
-                const fresh = reason === 'startup'
+                const sinceDownload = now - session.completedAt;
+                const interval = syncConfig.intervalMinutes * 60000;
+                // Navigation inside a session reuses its download, but not for longer than
+                // the polling interval, or a device that keeps browsing never sees what
+                // other devices recorded.
+                const fresh = (reason === 'startup' && sinceDownload < interval)
                     || (reason === 'push' && !pending)
-                    || (reason === 'focus' && now - session.completedAt < REMOTE_REFRESH_MIN_GAP_MS)
-                    || (reason === 'poll' && now - session.completedAt < syncConfig.intervalMinutes * 60000);
+                    || (reason === 'focus' && sinceDownload < REMOTE_REFRESH_MIN_GAP_MS)
+                    || (reason === 'poll' && sinceDownload < interval);
                 if (fresh) {
-                    await storeValue(SYNC_SESSION_KEY, { ...session, activeAt: now });
+                    if (shared) await storeValue(SYNC_SESSION_KEY, { ...session, activeAt: now });
                     lastRemoteSyncAt = session.completedAt;
                     remoteWorkerVersion = session.workerVersion || '';
                     lastRemoteError = '';
@@ -1626,24 +1996,35 @@
                 }
             }
 
-            let outgoing = localChangesSince(pushedAt);
+            // Against a store this device has no place with yet, download first and then send
+            // only what the store turns out to lack, rather than everything held: after an
+            // update every reloaded tab on AdGuard starts out this way, each from its own copy.
+            let reconciling = !position;
+            const pulledAt = new Map();
+            // Back on a worker after syncing with another one: what that one confirmed may
+            // have been dropped from the list since, so everything goes up once.
+            const switchedBack = Boolean(position) && Boolean(session?.endpoint)
+                && session.endpoint !== syncConfig.endpoint;
+            let outgoing = reconciling ? [] : (switchedBack ? everythingHeld() : outstandingChanges(tag));
             let sent = 0;
             let changed = false;
             let absorbed = false;
             let legacy = false;
             let downloadComplete = false;
             let uploadedMeta = '';
+            let restarted = false;
 
             for (let page = 0; page < MAX_SYNC_PAGES; page += 1) {
                 const batch = outgoing.slice(0, REMOTE_PAGE_ROWS);
                 await checkSyncOwnership();
                 uploadedMeta = metadataSignature();
+                const sentCursor = cursor;
                 const answer = await requestRemote({
                     client: SCRIPT_VERSION,
                     cursor,
                     limit: REMOTE_PAGE_ROWS,
                     meta: localMeta(),
-                    changes: batch,
+                    changes: batch.map(item => item.change),
                 });
                 if (!answer || typeof answer !== 'object') {
                     throw new Error('the worker returned nothing');
@@ -1655,80 +2036,100 @@
                 if (answer.state && typeof answer.state === 'object' && answer.cursor === undefined) {
                     legacy = true;
                     downloadComplete = true;
-                    const echoed = await requestRemote({ client: SCRIPT_VERSION, state: serializeState() });
+                    const echoed = await requestRemote({ client: SCRIPT_VERSION, state: portableState() });
                     const document = echoed?.state && typeof echoed.state === 'object' ? echoed.state : answer.state;
                     if (applyStoredState(document)) changed = true;
                     if (lastMergeAdopted) absorbed = true;
                     lowerJournalSince(lastMergeOldest);
+                    markSent(outgoing, tag);
+                    reconciling = false;
+                    // Nothing about this store counts towards a worker that speaks cursors,
+                    // should one answer at this address again.
+                    position = { epoch: 'document', gen: Date.now(), cursor: 0 };
+                    cursor = 0;
                     break;
                 }
 
+                const epoch = typeof answer.epoch === 'string' ? answer.epoch.slice(0, 64) : '';
+                const answered = Math.max(0, Number(answer.cursor) || 0);
+                // Not the store this device counted against: the worker came back empty, or a
+                // different store answers at this address. Start over against it, and send it
+                // everything, since it may hold none of it.
+                const reset = Boolean(position)
+                    && ((position.epoch && position.epoch !== epoch) || answered < sentCursor);
+                if (reset && !restarted) {
+                    restarted = true;
+                    position = { epoch, gen: Date.now(), cursor: 0 };
+                    cursor = 0;
+                    reconciling = true;
+                    pulledAt.clear();
+                    outgoing = [];
+                    continue;
+                }
+                if (!position) position = { epoch, gen: Date.now(), cursor: 0 };
+                else if (!position.epoch && epoch) position = { ...position, epoch };
+
+                markSent(batch, tag);
                 outgoing = outgoing.slice(batch.length);
                 sent += batch.length;
-                cursor = Math.max(0, Number(answer.cursor) || 0);
+                cursor = answered;
                 applyingRemoteState = true;
                 if (applyStoredState(documentFromRows(answer.changes, answer.meta))) changed = true;
-                // Pulled rows exist nowhere else on this device until they are saved.
-                lowerJournalSince(lastMergeOldest);
+                // Pulled rows go into the journal as well: they are what this page's place
+                // in the sync vouches for, and the journal carries that place.
+                (Array.isArray(answer.changes) ? answer.changes : []).forEach(row => {
+                    if (!row || typeof row !== 'object' || !row.key) return;
+                    const id = `${row.kind === 'o' ? 'o' : 'v'}|${row.key}`;
+                    journalExtras.set(id, journalGeneration);
+                    if (reconciling) pulledAt.set(id, Math.max(pulledAt.get(id) || 0, parseTimestamp(row.at)));
+                });
                 // A batch can carry nothing but protective metadata—a tombstone, a newer
                 // `resetAt`, `prunedBefore` or `settingsUpdatedAt`—which removes nothing on
-                // screen and so leaves `changed` false. It still has to be saved: the cursor
-                // moves past it either way, and losing it lets a stale sibling tab merge an
-                // already-deleted visit back in.
+                // screen and so leaves `changed` false. It still has to be saved.
                 if (lastMergeAdopted) absorbed = true;
                 applyingRemoteState = false;
                 downloadComplete = !answer.more;
+                if (reconciling && downloadComplete) {
+                    reconciling = false;
+                    outgoing = reconcileWith(pulledAt, tag);
+                }
                 if (!outgoing.length && downloadComplete) break;
             }
+            // The page budget ran out before the store was fully downloaded, so what it
+            // lacks is not known yet: everything held is listed as unsent for it.
+            if (reconciling) {
+                localChangesSince(0).forEach(change => noteLocalChange(change.kind, change.key, change.at));
+            }
 
-            // What was pulled has to be in storage before the cursor is allowed past it.
-            // The cursor is the durable record of what this device has already seen, so if
-            // it advanced first and the state write were then interrupted by a navigation or
-            // rejected outright, the next sync would ask only for rows after that cursor and
-            // the merged ones would never be offered again.
-            // A history without an id gets one now, and it has to be in storage before the
-            // cursor is recorded against it, for the same reason as the rows above.
+            forgetReconciled(tag);
+            // The rows and the place they reach go into storage in the same write.
             const naming = !legacy && !historyId;
             if (naming) historyId = makeHistoryId();
+            syncedThrough[tag] = { ...position, cursor };
+            // A sync that only sent changes moved nothing but this page's place and its
+            // list of what is sent; its journal records that, and the main document, which
+            // is far larger, is left as it is.
+            const rewrite = changed || absorbed || naming || needsCheckpoint;
             applyingRemoteState = true;
-            const saved = (changed || absorbed || naming || needsCheckpoint) ? await persistState() : true;
+            const saved = await persistState({ journalOnly: !rewrite });
             applyingRemoteState = false;
             if (!saved) throw new Error('the merged history could not be saved');
 
-            // Only recorded after the exchange succeeded: a failed sync has to send the same
-            // entries again rather than assume the worker took them.
-            // The horizon may only cover what actually went up. `outgoing` is still
-            // holding entries when the page budget ran out before they could be sent, and
-            // moving the horizon past them would retire them unsent.
-            const unsent = outgoing.reduce((oldest, change) => (
-                oldest ? Math.min(oldest, change.at) : change.at
-            ), 0);
-            // And something backdated may have arrived after this sync chose what to send,
-            // which pulled the horizon below where the exchange started. That entry was
-            // never offered, so the sync cannot claim it.
-            const arrived = syncConfig.pushedAt < pushedAt ? syncConfig.pushedAt : horizon;
-            await checkSyncOwnership();
-            const progressSaved = await writeSyncConfig({
-                ...syncConfig,
-                cursor: legacy ? 0 : cursor,
-                pushedAt: legacy ? 0 : Math.min(horizon, unsent || horizon, arrived),
-                remoteKey: legacy ? '' : syncConfig.endpoint,
-                historyId: legacy ? '' : historyId,
-            });
-
-            if (!progressSaved) throw new Error('sync progress could not be saved');
             // Only completed downloads suppress subsequent page-load requests. If the
             // page budget was exhausted, the next page must continue from the saved cursor.
-            if (downloadComplete) {
+            if (downloadComplete && shared) {
+                await checkSyncOwnership();
                 await storeValue(SYNC_SESSION_KEY, {
-                    endpoint: syncConfig.endpoint, historyId, uploadedMeta, workerVersion: remoteWorkerVersion,
-                    completedAt: Date.now(), activeAt: Date.now(),
+                    endpoint: syncConfig.endpoint, gen: position.gen, cursor, uploadedMeta,
+                    workerVersion: remoteWorkerVersion, completedAt: Date.now(), activeAt: Date.now(),
                 });
             }
             lastRemoteSyncAt = Date.now();
             lastRemoteError = '';
             const restored = visited.size - heldBefore;
-            if (recovering && restored > 0) {
+            // Only a history that had lost most of what the worker holds says so; one that
+            // was merely behind catches up without a word.
+            if (syncedBefore && !hadPosition && !legacy && restored > 0 && restored > heldBefore) {
                 console.info(`[JVS] Local history had lost its place in the sync; ${restored} visits were downloaded again.`);
                 showToast(`Restored ${restored} visited URLs from the worker.`);
             } else if (manual) {
@@ -1772,6 +2173,9 @@
     function syncOnFocus() {
         if (!syncConfigured()) return;
         if (Date.now() - lastRemoteAttemptAt < REMOTE_REFRESH_MIN_GAP_MS) return;
+        // Taken now rather than when the sync starts, so `focus` and `visibilitychange`
+        // arriving together for one activation queue one sync, not two.
+        lastRemoteAttemptAt = Date.now();
         queueSync({ reason: 'focus' });
     }
 
@@ -2156,6 +2560,7 @@
         if (shouldVisit) {
             visited.set(url, now);
             tombstones.delete(tombstoneKey('v', url));
+            noteLocalChange('v', url, now);
             rememberPendingVisit(url, now);
         } else {
             forgetVisited(url, now);
@@ -2181,6 +2586,7 @@
             overrides.set(url, current ? 'block' : 'allow');
             overrideTimes.set(url, now);
             tombstones.delete(tombstoneKey('o', url));
+            noteLocalChange('o', url, now);
         } else {
             forgetOverride(url, now);
         }
@@ -2493,7 +2899,7 @@
     }
 
     function exportState() {
-        const payload = JSON.stringify(serializeState(), null, 2);
+        const payload = JSON.stringify(portableState(), null, 2);
         const blob = new Blob([payload], { type: 'application/json' });
         const url = URL.createObjectURL(blob);
         const anchor = document.createElement('a');
@@ -2525,14 +2931,25 @@
             // entry by entry instead, which travels without taking the restored history
             // with it and leaves its timestamps intact.
             for (const url of visited.keys()) {
-                if (!restored.has(url)) tombstones.set(tombstoneKey('v', url), now);
+                if (!restored.has(url)) forgetVisited(url, now);
             }
             for (const url of overrides.keys()) {
-                if (!restoredOverrides.has(url)) tombstones.set(tombstoneKey('o', url), now);
+                if (!restoredOverrides.has(url)) forgetOverride(url, now);
             }
             // A restored entry outranks any removal this device was still carrying for it.
-            for (const url of restored.keys()) tombstones.delete(tombstoneKey('v', url));
-            for (const url of restoredOverrides.keys()) tombstones.delete(tombstoneKey('o', url));
+            // A removal newer than the backup's own timestamp would win every later merge
+            // and take the entry straight back out, so such an entry is stamped just past
+            // it; every other entry keeps the backup's timestamp.
+            for (const [url, at] of restored) {
+                const removedAt = tombstoneTime('v', url);
+                if (removedAt >= at) restored.set(url, removedAt + 1);
+                tombstones.delete(tombstoneKey('v', url));
+            }
+            for (const url of restoredOverrides.keys()) {
+                const removedAt = tombstoneTime('o', url);
+                if (removedAt >= (restoredOverrideTimes.get(url) || 0)) restoredOverrideTimes.set(url, removedAt + 1);
+                tombstones.delete(tombstoneKey('o', url));
+            }
 
             stampSettings(sanitizeSettings(parsed.settings), { all: true });
             visited = restored;
@@ -2551,12 +2968,16 @@
                 }
             }
             pruneVisited();
-            // Everything restored is stamped in the past, so without this the push horizon
-            // would already be sitting in front of it and none of it would ever go up.
-            const oldest = [...visited.values(), ...overrideTimes.values()]
-                .reduce((least, at) => (least ? Math.min(least, at) : at), 0);
-            lowerPushHorizon(oldest);
-            lowerJournalSince(oldest);
+            // Everything restored goes up, and the journal carries it until the main
+            // document does.
+            for (const [url, at] of visited) {
+                noteLocalChange('v', url, at);
+                journalExtras.set(`v|${url}`, journalGeneration);
+            }
+            for (const [url] of overrides) {
+                noteLocalChange('o', url, overrideTimes.get(url) || 0);
+                journalExtras.set(`o|${url}`, journalGeneration);
+            }
             persistState();
             setRootState();
             processAllCards();
@@ -2851,7 +3272,6 @@
 
     function applyStoredState(stored) {
         const merged = mergeStoredState(stored, { adoptSettings: true });
-        notePushBacklog();
         if (!merged) return false;
         pruneVisited();
         setRootState();
@@ -2863,6 +3283,7 @@
 
     function reloadRemoteState(newValue) {
         adoptHistoryId(newValue);
+        adoptSyncedThrough(newValue);
         if (applyStoredState(newValue)) showToast('Settings synchronized from another tab.');
     }
 
@@ -2873,6 +3294,7 @@
         if (document.visibilityState === 'hidden') return;
         const stored = await readStoredState();
         adoptHistoryId(stored);
+        adoptSyncedThrough(stored);
         applyStoredState(stored);
     }
 
@@ -2962,9 +3384,25 @@
         resetAt = parseTimestamp(initialState?.resetAt);
         prunedBefore = parseTimestamp(initialState?.prunedBefore);
         historyId = parseHistoryId(initialState?.historyId);
+        syncedThrough = parseSyncPositions(initialState?.syncedThrough);
+        outbox = parseOutbox(initialState?.outbox);
         lastKnownUpdatedAt = parseTimestamp(initialState?.updatedAt);
         settingsUpdatedAt = parseTimestamp(initialState?.settingsUpdatedAt) || lastKnownUpdatedAt;
         settingTimes = documentSettingTimes(initialState);
+        // combineSnapshot carries removals along without applying them, and a journal can
+        // still hold a visit that was unmarked or cleared after it was written. Apply them
+        // here by the same rules as mergeStoredState, or the page paints those visits and
+        // its first save writes them back next to their own tombstones.
+        for (const [url, at] of visited) {
+            if (at <= resetAt || at <= prunedBefore || at <= tombstoneTime('v', url)) visited.delete(url);
+        }
+        for (const url of [...overrides.keys()]) {
+            const removedAt = tombstoneTime('o', url);
+            if (removedAt && (overrideTimes.get(url) || 0) <= removedAt) {
+                overrides.delete(url);
+                overrideTimes.delete(url);
+            }
+        }
     }
 
     async function boot() {
@@ -2983,6 +3421,7 @@
         const [config, journals] = await Promise.all([configPromise, journalsPromise]);
         syncConfig = config;
         const snapshot = { main, journals };
+        loadedSnapshot = snapshot;
         initializeState(combineSnapshot(snapshot));
         const replayed = replayPendingVisits();
         pruneVisited();
@@ -2990,6 +3429,7 @@
         processAllCards();
         await migrateLegacyHistory();
         if (replayed || journalsAhead(snapshot)) persistState();
+        retireJournals(Date.now());
         setRootState();
 
         if (document.readyState === 'loading') {
