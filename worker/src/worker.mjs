@@ -23,7 +23,7 @@
 const STORAGE_VERSION = 3;
 // Reported in every answer so the userscript can show which worker it is talking to. It
 // moves in step with the userscript's own version; a test holds the two together.
-export const WORKER_VERSION = '6.11.1';
+export const WORKER_VERSION = '6.12.0';
 const OBJECT_NAME = 'default';
 const MAX_BODY_BYTES = 8 * 1024 * 1024;
 const MAX_PAGE_ROWS = 2000;
@@ -115,6 +115,18 @@ export class SyncStore {
             name,
             JSON.stringify(value),
         );
+    }
+
+    // A random id for this store, made once. A device that finds a different one answering
+    // at the same address knows the store it counted against is gone—recreated empty, or
+    // replaced—and starts over, sending everything it holds.
+    #epoch() {
+        let epoch = this.#meta('epoch', '');
+        if (typeof epoch !== 'string' || !epoch) {
+            epoch = crypto.randomUUID();
+            this.#setMeta('epoch', epoch);
+        }
+        return epoch;
     }
 
     #nextSeq() {
@@ -264,6 +276,7 @@ export class SyncStore {
 
         return {
             worker: WORKER_VERSION,
+            epoch: this.#epoch(),
             cursor: more ? changes[limit - 1].seq : timestamp(this.#meta('seq', 0)),
             more,
             meta: this.#readMeta(),

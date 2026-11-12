@@ -336,7 +336,10 @@ test('a visit a racing write dropped from the main document comes back from the 
     assert.deepEqual(visitedUrls(store), ['https://javstore.net/a.html']);
 });
 
-test('a journal is retired once it has sat past its TTL, and not before', async () => {
+// A journal key is written for a few minutes and then left final. It is removed once a tab
+// that loaded after it was final finds it covered by the main document it loaded, and
+// enough time has passed that no tab lacking it may still write the main document.
+test('a journal is retired once it has been final past its TTL, and not before', async () => {
     const store = makeStore();
     const first = await openTab(store, { html: listing() });
     clickCard(first.window, '/a.html');
@@ -349,12 +352,17 @@ test('a journal is retired once it has sat past its TTL, and not before', async 
     await settle();
     assert.ok(store.journals().includes(firstJournal), 'a recent journal is kept');
 
-    const aged = store.read(firstJournal);
-    aged.writtenAt -= 11 * 60000;
-    store.write(firstJournal, aged);
-    clickCard(second.window, '/c.html');
+    // The same journal, started 20 minutes ago: final for 15, and covered by the main
+    // document a tab loading now finds.
+    const createdAt = Date.now() - 20 * 60000;
+    const aged = firstJournal.replace(/_v2_[0-9a-z]+_/, `_v2_${createdAt.toString(36)}_`);
+    store.data.set(aged, store.data.get(firstJournal));
+    store.data.delete(firstJournal);
+    const third = await openTab(store, { html: listing() });
+    clickCard(third.window, '/c.html');
     await settle();
-    assert.ok(!store.journals().includes(firstJournal), 'the aged journal is retired');
+    assert.ok(!store.journals().includes(aged), 'the aged journal is retired');
+    assert.ok(store.journals().length > 0, 'recent journals stay');
     assert.deepEqual(visitedUrls(store), CARDS.map(([href]) => `https://javstore.net${href}`));
 });
 

@@ -70,15 +70,17 @@ test('review: a long-open tab does not delete a journal its owner rewrote after 
     // Loaded after the owner's first save, so its snapshot holds that copy of the journal.
     const stale = await open();
     clock.offset = TTL_PLUS;
-    // Only the owner records b (a manual mark; a click whose item tab never loaded).
+    // Only the owner records b (a manual mark; a click whose item tab never loaded). The
+    // owner is itself long-open by now, so b goes to its journal, which has moved on to a
+    // new key that carries everything the old one did.
     pressOnCard(owner.window, '/b.html', 'v');
     await settle();
-    assert.deepEqual(visitedUrls(store), [u('/a.html'), u('/b.html')]);
+    const holdsB = () => store.journals().some(key => store.read(key)?.visited?.[u('/b.html')]);
+    assert.ok(holdsB(), 'the owner journal carries b');
 
     clickCard(stale.window, '/c.html');
     await settle();
-    assert.ok(store.journals().includes(ownerJournal),
-        'the owner journal was rewritten after the stale tab loaded, so it is not stale');
+    assert.ok(holdsB(), 'the stale tab left the owner journal alone');
 
     const fresh = await open();
     await settle();

@@ -220,7 +220,7 @@ test('"Clear visited history" is not undone by journals of other pages', async (
 // save then "retires" B's journal: it checks writtenAt against its own snapshot, which
 // still holds B's old journal, so it deletes the live key. A's main-document write has
 // already dropped what B recorded after A loaded, so nothing in storage holds it.
-test('a long-open tab does not delete journals other live tabs have rewritten since it loaded', { todo: 'retireJournals trusts a stale snapshot (data loss)' }, async () => {
+test('a long-open tab does not delete journals other live tabs have rewritten since it loaded', async () => {
     const store = makeStore({ snapshotPerTab: true });
     const b = await openTab(store, { html: listing() });
     clickCard(b.window, '/a.html');
@@ -246,7 +246,7 @@ test('a long-open tab does not delete journals other live tabs have rewritten si
 // A fresh tab later merges C's journal into the main document and, a TTL on, retires it.
 // Then A, which loaded before C existed, saves: its write is built on the snapshot it took
 // at load and drops C's visit. No journal is left to bring it back.
-test('a long-open tab\'s save does not drop visits other tabs recorded after it loaded', { todo: 'stale tabs write the whole document (data loss when sync is off or the push failed)' }, async () => {
+test('a long-open tab\'s save does not drop visits other tabs recorded after it loaded', async () => {
     const store = makeStore({ snapshotPerTab: true });
     const a = await openTab(store, { html: listing() }); // open for hours
     const c = await openTab(store, { html: detailHtml, url: 'https://javstore.net/700003-Item-pn.html' });
@@ -271,33 +271,42 @@ test('a long-open tab\'s save does not drop visits other tabs recorded after it 
 });
 
 // A V-unmark is a per-URL tombstone, and a journal carries it only while it is newer than
-// the journal's horizon (resetAt, by contrast, rides in every journal, so a clear
-// survives in whichever fresh journal is newest). Once the unmarking tab's journal has
-// been retired, a tab that loaded before the unmark writes the visit back without the
-// tombstone, and every later page shows it as visited again.
-test('a long-open tab cannot undo a V-unmark once the unmarking journal is retired', { todo: 'stale tabs write the whole document (unmarked visits come back)' }, async () => {
+// the journal's horizon. Once the unmarking tab's journal has been retired, a tab that
+// loaded before the unmark must not write the visit back over the main document. One
+// clock for every tab, moved forward, stands in for the hours the old tab stays open.
+test('a long-open tab cannot undo a V-unmark once the unmarking journal is retired', async () => {
     const store = makeStore({ snapshotPerTab: true });
-    const seed = await openTab(store, { html: listing() });
+    const clock = { offset: 0 };
+    const open = () => openTab(store, { html: listing(), beforeRun(window) {
+        const realNow = window.Date.now.bind(window.Date);
+        window.Date.now = () => realNow() + clock.offset;
+    } });
+    const seed = await open();
     clickCard(seed.window, '/a.html');
     await waitFor(() => visitedUrls(store).length === 1);
     closeTab(seed);
 
-    const a = await openTab(store, { html: listing() }); // open for hours
-    const unmarker = await openTab(store, { html: listing() });
+    const a = await open(); // open for hours
+    const unmarker = await open();
     pressOnCard(unmarker.window, '/a.html', 'v');
     await waitFor(() => visitedUrls(store).length === 0);
     await settle();
     closeTab(unmarker);
-    store.journals().forEach(key => age(store, key));
-    const d = await openTab(store, { html: listing() });
-    clickCard(d.window, '/c.html'); // a fresh save that retires the aged journals
-    await waitFor(() => visitedUrls(store).includes(abs('/c.html')) && store.journals().length === 1);
+    const unmarkerJournals = store.journals();
+
+    clock.offset = 17 * 60000;
+    const d = await open();
+    clickCard(d.window, '/c.html'); // a fresh save; the unmarking journal is retired
+    await waitFor(() => visitedUrls(store).includes(abs('/c.html'))
+        && unmarkerJournals.every(key => !store.journals().includes(key)));
     await settle();
 
     clickCard(a.window, '/b.html'); // any save by the long-open tab
     await settle(80);
-    const e = await openTab(store, { html: listing() });
+    const e = await open();
+    await settle();
     assert.ok(!card(e.window, '/a.html').classList.contains('jvs-visited'), 'the unmarked visit stays unmarked');
+    assert.ok(card(e.window, '/b.html').classList.contains('jvs-visited'), 'the old tab\'s own visit is kept');
 });
 
 // The sync lock is held for the whole exchange. GM_xmlhttpRequest has a 20 s timeout, but
@@ -306,7 +315,7 @@ test('a long-open tab cannot undo a V-unmark once the unmarking journal is retir
 // every other tab's sync queues behind it. Timers in the hung tab are sped up 100x, so a
 // page-side timeout of REMOTE_TIMEOUT_MS would release the lock within a fraction of a
 // second here.
-test('a request that never settles in one tab does not block every other tab\'s sync', { todo: 'fetchRemote has no timeout; the lock is held indefinitely (sync stalls on all tabs)' }, async () => {
+test('a request that never settles in one tab does not block every other tab\'s sync', async () => {
     const store = makeStore();
     const remote = makeRemote();
     enableSync(store, remote);
@@ -371,7 +380,7 @@ test('measure: activating long-open tabs on a snapshot engine with sync on', asy
 // lastRemoteAttemptAt is set only once runSync gets the lock, after both handlers ran.
 // The second one finds the session fresh and only reads storage and rewrites the session,
 // but that is still two full-document reads on top of the two refreshFromStorage reads.
-test('measure: one tab activation runs two syncs (visibilitychange and focus)', async t => {
+test('measure: one tab activation runs one sync (visibilitychange and focus)', async t => {
     const store = makeStore();
     const remote = makeRemote();
     enableSync(store, remote);
@@ -390,8 +399,7 @@ test('measure: one tab activation runs two syncs (visibilitychange and focus)', 
     await settle(80);
     const cost = m.since(before);
     t.diagnostic(`activation with sync on: ${describe(cost)}, session writes ${cost.sessionWrites}, requests ${remote.requests.length - 1}`);
-    assert.equal(cost.sessionWrites, 2, 'both handlers queue a sync before either records its attempt');
-    assert.ok(cost.mainReads >= 4, 'two refreshes plus two sync snapshots read the document');
+    assert.equal(cost.sessionWrites, 1, 'the second handler finds the first one\'s attempt');
 });
 
 // After the page comes back from the back/forward cache its timers are restarted and the

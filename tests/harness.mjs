@@ -365,3 +365,17 @@ export async function waitFor(check, { timeout = 9000, interval = 20 } = {}) {
 export function visitedUrls(store) {
     return Object.keys(store.state()?.visited || {}).sort();
 }
+
+// How far into the worker's history this device's stored history reaches: the furthest
+// position recorded in the main document or any journal. Since 6.12.0 the position lives
+// with the rows it describes, not in the sync configuration.
+export function syncPosition(store) {
+    const docs = [store.state(), ...store.journals().map(key => store.read(key))].filter(Boolean);
+    let furthest = 0;
+    for (const doc of docs) {
+        const positions = doc.syncedThrough && typeof doc.syncedThrough === 'object' ? doc.syncedThrough : {};
+        const values = typeof positions.remote === 'string' ? [positions] : Object.values(positions);
+        for (const position of values) furthest = Math.max(furthest, Number(position?.cursor) || 0);
+    }
+    return furthest;
+}

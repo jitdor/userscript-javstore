@@ -4,7 +4,7 @@ import worker, { WORKER_VERSION } from '../worker/src/worker.mjs';
 import fs from 'node:fs';
 import {
     makeStore, makeRemote, enableSync, openTab, closeTabs, settle, waitFor,
-    listingHtml, card, clickCard, pressOnCard, visitedUrls,
+    listingHtml, card, clickCard, pressOnCard, visitedUrls, syncPosition,
 } from './harness.mjs';
 
 const CARDS = [['/a.html', 'Alpha'], ['/b.html', 'Beta'], ['/c.html', 'Gamma']];
@@ -400,9 +400,12 @@ test('the cursor does not move past history that could not be saved', async () =
     // Long enough for the write to be retried and given up on.
     await settle(600);
     assert.equal(secondStore.state(), null, 'precondition: the history never landed');
+    // A position may only be stored beside the rows it vouches for: here that is the
+    // journal, which the failed write of the main document did not take with it.
+    const journaled = secondStore.journals().map(key => secondStore.read(key));
     assert.ok(
-        !secondStore.read('javstore_sync_config_v1').cursor,
-        'a cursor recorded here would skip the rows that were lost',
+        !syncPosition(secondStore) || journaled.some(doc => doc.visited?.['https://javstore.net/a.html']),
+        'a position recorded without its rows would skip the rows that were lost',
     );
 
     // Reopening the device is the reload after the failed write: the rows have to come
@@ -429,7 +432,7 @@ test('a merge that only brings back a tombstone is still saved', async () => {
     await waitFor(() => secondStore.state());
     assert.deepEqual(secondStore.state().overrides, {});
     assert.ok(secondStore.state().tombstones[`o|${url}`], 'the tombstone reached storage');
-    assert.ok(secondStore.read('javstore_sync_config_v1').cursor > 0);
+    assert.ok(syncPosition(secondStore) > 0);
 });
 
 test('pointing the panel at a different worker starts over', async () => {
@@ -445,7 +448,7 @@ test('pointing the panel at a different worker starts over', async () => {
     clickCard(tab.window, '/a.html');
     await settle();
     await syncNow(tab);
-    assert.ok(store.read('javstore_sync_config_v1').cursor > 0);
+    assert.ok(syncPosition(store) > 0);
 
     const form = tab.shadow().querySelector('form.sync-form');
     form.elements.syncEndpoint.value = second.endpoint;
@@ -471,18 +474,14 @@ test('a device that lost its history but kept its cursor downloads it again', as
     await settle();
     await syncNow(tab);
     assert.equal(remote.visited().length, 3);
-    assert.ok(store.read('javstore_sync_config_v1').cursor > 0);
+    assert.ok(syncPosition(store) > 0);
     closeTabs();
 
     loseHistory(store);
     const reopened = await openTab(store, { html: listing(), remote });
     await waitFor(() => visitedUrls(store).length === 3);
     assert.ok(card(reopened.window, '/b.html').classList.contains('jvs-visited'));
-    assert.equal(
-        store.read('javstore_sync_config_v1').historyId,
-        store.state().historyId,
-        'the cursor is recorded against the history that now holds the rows',
-    );
+    await waitFor(() => syncPosition(store) > 0);
 });
 
 test('a visit recorded after the history was lost does not hide what is missing', async () => {
@@ -859,9 +858,8 @@ test('a click replayed from the previous page reaches the worker', async () => {
 
     // What a dropped GM write leaves behind: a click stamped before the last push, which
     // only the next page load in that tab will find.
-    const config = store.read('javstore_sync_config_v1');
     const session = new Map([['javstore_pending_visits', JSON.stringify([
-        { url: 'https://javstore.net/c.html', at: config.pushedAt - 5000 },
+        { url: 'https://javstore.net/c.html', at: Date.now() - 5000 },
     ])]]);
     first.window.close();
 

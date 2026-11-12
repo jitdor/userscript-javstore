@@ -2,7 +2,7 @@ import test, { afterEach } from 'node:test';
 import assert from 'node:assert/strict';
 import {
     makeStore, makeRemote, enableSync, openTab, closeTabs, settle, waitFor,
-    listingHtml, detailHtml, card, pressOnCard, visitedUrls,
+    listingHtml, detailHtml, card, pressOnCard, visitedUrls, syncPosition,
 } from './harness.mjs';
 
 const SESSION_KEY = 'javstore_sync_session_v1';
@@ -81,7 +81,7 @@ test('an old tab reads the cursor advanced by another tab before syncing', async
     const newer = await openTab(store, { html: listing(), remote });
     remote.store.sync({ cursor: 0, changes: [{ kind: 'v', key: 'https://javstore.net/new.html', at: Date.now() }] });
     await manualSync(newer, store);
-    const cursor = store.read(CONFIG_KEY).cursor;
+    const cursor = syncPosition(store);
     await manualSync(old, store);
     assert.equal(remote.requests.at(-1).body.cursor, cursor);
     assert.equal(remote.responses.at(-1).changes.length, 0);
@@ -102,7 +102,7 @@ test('concurrent first tabs share one restoration', async () => {
 test('idle session expiry checks for new rows without discarding the cursor', async () => {
     const remote = seededRemote(1);
     const { store } = await restored(remote);
-    const cursor = store.read(CONFIG_KEY).cursor;
+    const cursor = syncPosition(store);
     const session = store.read(SESSION_KEY);
     store.write(SESSION_KEY, { ...session, activeAt: Date.now() - 31 * 60000 });
     await openTab(store, { html: listing(), remote });
@@ -127,30 +127,39 @@ test('lost history bypasses the session marker, then the next page reuses the re
     assert.equal(remote.requests.length, 2);
 });
 
-test('a rejected progress write does not mark restoration complete', async () => {
+test('a rejected history write does not mark restoration complete', async () => {
     const remote = seededRemote(1);
     const store = makeStore();
     enableSync(store, remote);
     const set = store.set.bind(store);
-    store.set = async (key, value) => { if (key !== CONFIG_KEY) await set(key, value); };
+    const history = key => key === STATE_KEY || key.startsWith('javstore_journal_');
+    store.set = async (key, value) => { if (!history(key)) await set(key, value); };
     const tab = await openTab(store, { html: listing(), remote });
-    await waitFor(() => tab.shadow().textContent.includes('sync progress could not be saved'));
+    await waitFor(() => tab.shadow().textContent.includes('Could not save'));
+    await settle(200);
     assert.equal(store.read(SESSION_KEY), undefined);
+    assert.equal(syncPosition(store), 0);
     store.set = set;
     await manualSync(tab, store);
-    assert.ok(store.read(CONFIG_KEY).cursor > 0);
+    assert.ok(syncPosition(store) > 0);
     assert.ok(store.read(SESSION_KEY).completedAt);
 });
 
-test('fallback lease coordinates first tabs without Web Locks and can recover an expired owner', async () => {
+// Without Web Locks, and without notice of other tabs' writes, a lease kept in storage
+// cannot exclude anything (each tab reads back its own claim), and one left behind by a
+// closed tab would hold the next ones up. Tabs then sync side by side: a few duplicate
+// requests, and the same history.
+test('without Web Locks, first tabs sync side by side without waiting on a stale lease', async () => {
     const remote = seededRemote(1);
     const store = makeStore({ latency: 2 });
     enableSync(store, remote);
-    store.write('javstore_sync_lease_v1', { owner: 'closed-tab', expiresAt: Date.now() - 1 });
+    store.write('javstore_sync_lease_v1', { owner: 'closed-tab', expiresAt: Date.now() + 90000 });
+    const started = Date.now();
     await Promise.all(Array.from({ length: 5 }, () => openTab(store, { html: listing(), remote, webLocks: false })));
     await waitFor(() => store.read(SESSION_KEY)?.completedAt);
     await settle(600);
-    assert.equal(remote.requests.length, 1);
+    assert.ok(Date.now() - started < 8000, 'held up by a lease');
+    assert.ok(remote.requests.length <= 5);
     assert.equal(visitedUrls(store).length, 1);
 });
 
@@ -161,7 +170,7 @@ test('an incomplete paged download resumes on the next page instead of marking t
     const store = makeStore();
     enableSync(store, remote);
     await openTab(store, { html: listing(), remote });
-    await waitFor(() => store.read(CONFIG_KEY).cursor === 12);
+    await waitFor(() => syncPosition(store) === 12);
     assert.equal(store.read(SESSION_KEY), undefined);
     await openTab(store, { html: listing(), remote });
     await waitFor(() => store.read(SESSION_KEY)?.completedAt);
@@ -207,7 +216,7 @@ test('an older history written back by a long-open tab catches up quietly from i
     const store = makeStore({ snapshotPerTab: true });
     await restored(remote, store);
     const old = await openTab(store, { html: listing(), remote, url: 'https://javstore.net/page/1' });
-    const reachedByOld = store.read(CONFIG_KEY).cursor;
+    const reachedByOld = syncPosition(store);
 
     // Another device adds visits, then this device loses its history while the old tab
     // stays open. The next page is a genuine recovery, and says so once.
