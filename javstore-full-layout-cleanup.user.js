@@ -161,12 +161,17 @@
     // the same address is noticed; `gen` is when this device started counting against
     // that store, so a position from an earlier start never outranks a later one.
     let syncedThrough = {};
-    // Changes made on this device that the worker has to hear about, keyed `kind|key`:
-    // `at` is the change, `sent` the newest change the worker has confirmed, `t` when the
-    // entry last changed. A change is outstanding while `at > sent`. Both only ever grow,
-    // so copies merge by taking the larger of each, and an older copy can at worst offer a
-    // confirmed change once more—which the worker takes as already known.
+    // Changes made on this device that workers have to hear about, keyed `kind|key`: `at`
+    // is the change, `sent` the newest change each worker (by tag) has confirmed, `t` when
+    // the entry last changed. A change is outstanding for a worker while `at` is past what
+    // that worker confirmed. Everything only ever grows, so copies merge by taking the
+    // larger of each, and an older copy can at worst offer a confirmed change once more—
+    // which the worker takes as already known.
     let outbox = new Map();
+    // Entries this page took on from outside local storage—rows pulled from the worker, a
+    // restored backup—which its journal carries whatever their age. A journal reaching
+    // back in time instead would carry everything stamped since the oldest of them.
+    const journalExtras = new Set();
     let settingsUpdatedAt = 0;
     // When each setting was last changed on purpose, keyed by setting name. Settings merge
     // field by field on these, so changing one setting on one device does not carry that
@@ -420,8 +425,8 @@
         const outboxAhead = [...parseOutbox(doc.outbox)].some(([id, entry]) => {
             const held = baseOutbox.get(id);
             // A change already confirmed may have been dropped from the main list.
-            if (!held) return entry.at > entry.sent;
-            return entry.at > held.at || entry.sent > held.sent;
+            if (!held) return !Object.values(entry.sent).some(mark => mark >= entry.at);
+            return mergedOutboxEntry(held, entry) !== null;
         });
         const basePositions = parseSyncPositions(base.syncedThrough);
         const positionAhead = Object.entries(parseSyncPositions(doc.syncedThrough))
@@ -616,12 +621,8 @@
             newest(combined.tombstones, doc.tombstones);
             combined.resetAt = Math.max(combined.resetAt, parseTimestamp(doc.resetAt));
             for (const [id, entry] of parseOutbox(doc.outbox)) {
-                const held = outboxes.get(id);
-                outboxes.set(id, held ? {
-                    at: Math.max(held.at, entry.at),
-                    sent: Math.max(held.sent, entry.sent),
-                    t: Math.max(held.t, entry.t),
-                } : entry);
+                const merged = mergedOutboxEntry(outboxes.get(id), entry);
+                if (merged) outboxes.set(id, merged);
             }
             Object.entries(parseSyncPositions(doc.syncedThrough)).forEach(([tag, position]) => {
                 positions[tag] = newerSyncPosition(positions[tag], position);
@@ -648,7 +649,7 @@
                 }
             }
         });
-        combined.outbox = Object.fromEntries([...outboxes].map(([id, entry]) => [id, [entry.at, entry.sent, entry.t]]));
+        combined.outbox = Object.fromEntries([...outboxes].map(([id, entry]) => [id, serializeOutboxEntry(entry)]));
         combined.syncedThrough = positions;
         return combined;
     }
@@ -664,10 +665,10 @@
     }
 
     function serializeJournal(writtenAt) {
-        const pick = source => {
+        const pick = (source, kind = '') => {
             const result = {};
             for (const [key, at] of source) {
-                if (at >= journalSince) result[key] = at;
+                if (at >= journalSince || journalExtras.has(kind ? `${kind}|${key}` : key)) result[key] = at;
             }
             return result;
         };
@@ -675,21 +676,26 @@
         const journalOverrideTimes = {};
         for (const [url, value] of overrides) {
             const at = overrideTimes.get(url) || 0;
-            if (at >= journalSince) {
+            if (at >= journalSince || journalExtras.has(`o|${url}`)) {
                 journalOverrides[url] = value;
                 journalOverrideTimes[url] = at;
             }
         }
+        // Only what is still to be sent: a confirmation that never reaches the main
+        // document costs one repeated upload, which the worker takes as already known.
+        const tag = syncConfigured() ? remoteTag(syncConfig.endpoint) : '';
         const journalOutbox = {};
         for (const [id, entry] of outbox) {
-            if (entry.t >= journalSince) journalOutbox[id] = [entry.at, entry.sent, entry.t];
+            if (entry.t >= journalSince && (!tag || isOutstanding(entry, tag))) {
+                journalOutbox[id] = serializeOutboxEntry(entry);
+            }
         }
         const journal = {
             version: STORAGE_VERSION,
             writtenAt,
             resetAt,
             prunedBefore,
-            visited: pick(visited),
+            visited: pick(visited, 'v'),
             tombstones: pick(tombstones),
             overrides: journalOverrides,
             overrideTimes: journalOverrideTimes,
@@ -718,19 +724,17 @@
             || resetAt >= journalSince
             || settingsUpdatedAt >= journalSince;
         if (!carries) return null;
-        // A key that has been written long enough is left as it is, final, and the page
-        // moves to a new one that carries everything the old one did.
-        const previous = journalWritten && writtenAt - journalCreatedAt > JOURNAL_ROTATE_MS ? journalKey : '';
-        if (previous) {
+        // A key is named for the moment it is first written, so its name says when it can
+        // last have been written. One written long enough is left as it is, final, and the
+        // page moves to a new key that carries everything the old one did. The old one is
+        // not removed here: if the new write never lands (AdGuard does not say), it is the
+        // only copy. It goes once a newer tab finds it in the main document.
+        if (!journalWritten || writtenAt - journalCreatedAt > JOURNAL_ROTATE_MS) {
             journalCreatedAt = writtenAt;
             journalKey = makeJournalKey(journalCreatedAt);
         }
         await storeValue(journalKey, journal);
         journalWritten = true;
-        if (previous) {
-            // The new key holds everything the old one did, so the old one is only a copy.
-            await gmCall('deleteValue', previous).catch(() => {});
-        }
         return journal;
     }
 
@@ -1429,7 +1433,9 @@
         if (!a) return b || null;
         if (!b) return a;
         if (a.gen !== b.gen) return a.gen > b.gen ? a : b;
-        return a.cursor >= b.cursor ? a : b;
+        if (a.cursor !== b.cursor) return a.cursor > b.cursor ? a : b;
+        // The same place, one copy having learned the store's id since.
+        return a.epoch || !b.epoch ? a : b;
     }
 
     function sameSyncPosition(a, b) {
@@ -1445,6 +1451,16 @@
         });
     }
 
+    function parseSentMarks(value) {
+        const result = {};
+        if (!value || typeof value !== 'object' || Array.isArray(value)) return result;
+        Object.entries(value).slice(0, 20).forEach(([tag, mark]) => {
+            const at = parseTimestamp(mark);
+            if (tag && at) result[tag.slice(0, 40)] = at;
+        });
+        return result;
+    }
+
     function parseOutbox(value) {
         const result = new Map();
         if (!value || typeof value !== 'object' || Array.isArray(value)) return result;
@@ -1452,32 +1468,41 @@
             if (!/^[vo]\|./.test(id) || !Array.isArray(entry)) return;
             const at = parseTimestamp(entry[0]);
             if (!at) return;
-            result.set(id, { at, sent: parseTimestamp(entry[1]), t: parseTimestamp(entry[2]) || at });
+            result.set(id, { at, sent: parseSentMarks(entry[1]), t: parseTimestamp(entry[2]) || at });
         });
         return result;
     }
 
+    function serializeOutboxEntry(entry) {
+        return [entry.at, { ...entry.sent }, entry.t];
+    }
+
     function serializeOutbox() {
         const result = {};
-        for (const [id, entry] of outbox) result[id] = [entry.at, entry.sent, entry.t];
+        for (const [id, entry] of outbox) result[id] = serializeOutboxEntry(entry);
         return result;
+    }
+
+    // The larger of each part of two copies of one entry; `null` when `entry` adds nothing.
+    function mergedOutboxEntry(held, entry) {
+        if (!held) return { at: entry.at, sent: { ...entry.sent }, t: entry.t };
+        let grew = entry.at > held.at;
+        const sent = { ...held.sent };
+        Object.entries(entry.sent).forEach(([tag, mark]) => {
+            if (mark > (sent[tag] || 0)) {
+                sent[tag] = mark;
+                grew = true;
+            }
+        });
+        return grew ? { at: Math.max(held.at, entry.at), sent, t: Math.max(held.t, entry.t) } : null;
     }
 
     function mergeOutbox(source) {
         let grew = false;
         for (const [id, entry] of source) {
-            const held = outbox.get(id);
-            if (!held) {
-                outbox.set(id, { ...entry });
-                grew = true;
-                continue;
-            }
-            if (entry.at > held.at || entry.sent > held.sent) {
-                outbox.set(id, {
-                    at: Math.max(held.at, entry.at),
-                    sent: Math.max(held.sent, entry.sent),
-                    t: Math.max(held.t, entry.t),
-                });
+            const merged = mergedOutboxEntry(outbox.get(id), entry);
+            if (merged) {
+                outbox.set(id, merged);
                 grew = true;
             }
         }
@@ -1491,15 +1516,11 @@
         const id = `${kind}|${key}`;
         const held = outbox.get(id);
         if (held && held.at >= at) return;
-        outbox.set(id, { at, sent: held?.sent || 0, t: Date.now() });
+        outbox.set(id, { at, sent: { ...(held?.sent || {}) }, t: Date.now() });
     }
 
-    // Everything this device holds, as changes the worker has not heard of yet: for a
-    // worker this device has never synced with, or one that has come back empty.
-    function noteEverythingUnsent() {
-        for (const [url, at] of visited) noteLocalChange('v', url, at);
-        for (const [url] of overrides) noteLocalChange('o', url, overrideTimes.get(url) || 0);
-        for (const [key, at] of tombstones) noteLocalChange(key.slice(0, 1), key.slice(2), at);
+    function isOutstanding(entry, tag) {
+        return entry.at > (entry.sent[tag] || 0);
     }
 
     // The change the worker should get for an outbox entry, from what this device holds
@@ -1517,25 +1538,53 @@
         return removed ? { kind, key, at: removed, deleted: 1 } : null;
     }
 
-    function outstandingChanges() {
+    function outstandingChanges(tag) {
         const changes = [];
         for (const [id, entry] of outbox) {
-            if (entry.at <= entry.sent) continue;
+            if (!isOutstanding(entry, tag)) continue;
             const change = outgoingChange(id);
             if (change) {
                 changes.push({ id, mark: entry.at, change });
             } else {
                 // Gone here since: nothing to tell the worker.
-                outbox.set(id, { ...entry, sent: entry.at, t: Date.now() });
+                outbox.set(id, { ...entry, sent: { ...entry.sent, [tag]: entry.at }, t: Date.now() });
             }
         }
         return changes.sort((a, b) => a.change.at - b.change.at);
     }
 
-    function outstandingCount() {
+    function outstandingCount(tag) {
         let count = 0;
-        for (const entry of outbox.values()) if (entry.at > entry.sent) count += 1;
+        for (const entry of outbox.values()) if (isOutstanding(entry, tag)) count += 1;
         return count;
+    }
+
+    // After downloading a whole store: what it already holds is marked as sent to it, and
+    // what it lacks, or holds an older version of, is listed and returned to send.
+    // Entries listed only so a first upload survives an interrupted sync; once the worker
+    // has confirmed them, no other copy ever listed them, so they go straight away.
+    const reconcileListed = new Set();
+
+    function reconcileWith(pulledAt, tag) {
+        localChangesSince(0).forEach(change => {
+            const id = `${change.kind}|${change.key}`;
+            if ((pulledAt.get(id) || 0) >= change.at) {
+                const held = outbox.get(id);
+                if (held && held.at <= change.at) markSent([{ id, mark: held.at }], tag);
+            } else {
+                if (!outbox.has(id)) reconcileListed.add(id);
+                noteLocalChange(change.kind, change.key, change.at);
+            }
+        });
+        return outstandingChanges(tag);
+    }
+
+    function forgetReconciled(tag) {
+        for (const id of reconcileListed) {
+            const entry = outbox.get(id);
+            if (entry && !isOutstanding(entry, tag)) outbox.delete(id);
+        }
+        reconcileListed.clear();
     }
 
     function everythingHeld() {
@@ -1546,17 +1595,25 @@
         }));
     }
 
-    function markSent(batch) {
+    function markSent(batch, tag) {
         const now = Date.now();
         batch.forEach(({ id, mark }) => {
             const held = outbox.get(id);
-            if (held && mark > held.sent) outbox.set(id, { ...held, sent: mark, t: now });
+            if (held && mark > (held.sent[tag] || 0)) {
+                outbox.set(id, { ...held, sent: { ...held.sent, [tag]: mark }, t: now });
+            }
         });
     }
 
+    // A confirmed entry stays listed a while for older copies' sake. With sync off nothing
+    // is dropped: the list is bounded by the history itself, and it is what goes up once
+    // sync is back on.
     function pruneOutbox(now) {
+        const tag = syncConfigured() ? remoteTag(syncConfig.endpoint) : '';
+        if (!tag) return;
         for (const [id, entry] of outbox) {
-            if (entry.at <= entry.sent && now - entry.t > OUTBOX_KEEP_MS) outbox.delete(id);
+            if (now - entry.t <= OUTBOX_KEEP_MS) continue;
+            if (!isOutstanding(entry, tag) || !outgoingChange(id)) outbox.delete(id);
         }
     }
 
@@ -1906,7 +1963,7 @@
                 && Number.isFinite(session?.cursor) && session.gen === position.gen && cursor >= session.cursor
                 && session?.completedAt > 0 && now - session.activeAt < SYNC_SESSION_IDLE_MS;
             if (!manual && currentSession) {
-                const pending = outstandingCount() || session.uploadedMeta !== metadataSignature();
+                const pending = outstandingCount(tag) || session.uploadedMeta !== metadataSignature();
                 if (reason === 'startup' && pending) scheduleRemotePush();
                 const sinceDownload = now - session.completedAt;
                 const interval = syncConfig.intervalMinutes * 60000;
@@ -1926,9 +1983,16 @@
                 }
             }
 
-            // Everything this device holds goes up to a worker it has no place with yet;
-            // otherwise what is still outstanding.
-            let outgoing = position ? outstandingChanges() : everythingHeld();
+            // Against a store this device has no place with yet, download first and then send
+            // only what the store turns out to lack, rather than everything held: after an
+            // update every reloaded tab on AdGuard starts out this way, each from its own copy.
+            let reconciling = !position;
+            const pulledAt = new Map();
+            // Back on a worker after syncing with another one: what that one confirmed may
+            // have been dropped from the list since, so everything goes up once.
+            const switchedBack = Boolean(position) && Boolean(session?.endpoint)
+                && session.endpoint !== syncConfig.endpoint;
+            let outgoing = reconciling ? [] : (switchedBack ? everythingHeld() : outstandingChanges(tag));
             let sent = 0;
             let changed = false;
             let absorbed = false;
@@ -1964,7 +2028,8 @@
                     if (applyStoredState(document)) changed = true;
                     if (lastMergeAdopted) absorbed = true;
                     lowerJournalSince(lastMergeOldest);
-                    markSent(outgoing);
+                    markSent(outgoing, tag);
+                    reconciling = false;
                     // Nothing about this store counts towards a worker that speaks cursors,
                     // should one answer at this address again.
                     position = { epoch: 'document', gen: Date.now(), cursor: 0 };
@@ -1983,13 +2048,15 @@
                     restarted = true;
                     position = { epoch, gen: Date.now(), cursor: 0 };
                     cursor = 0;
-                    outgoing = everythingHeld();
+                    reconciling = true;
+                    pulledAt.clear();
+                    outgoing = [];
                     continue;
                 }
                 if (!position) position = { epoch, gen: Date.now(), cursor: 0 };
                 else if (!position.epoch && epoch) position = { ...position, epoch };
 
-                markSent(batch);
+                markSent(batch, tag);
                 outgoing = outgoing.slice(batch.length);
                 sent += batch.length;
                 cursor = answered;
@@ -1997,16 +2064,31 @@
                 if (applyStoredState(documentFromRows(answer.changes, answer.meta))) changed = true;
                 // Pulled rows go into the journal as well: they are what this page's place
                 // in the sync vouches for, and the journal carries that place.
-                lowerJournalSince(lastMergeOldest);
+                (Array.isArray(answer.changes) ? answer.changes : []).forEach(row => {
+                    if (!row || typeof row !== 'object' || !row.key) return;
+                    const id = `${row.kind === 'o' ? 'o' : 'v'}|${row.key}`;
+                    journalExtras.add(id);
+                    if (reconciling) pulledAt.set(id, Math.max(pulledAt.get(id) || 0, parseTimestamp(row.at)));
+                });
                 // A batch can carry nothing but protective metadata—a tombstone, a newer
                 // `resetAt`, `prunedBefore` or `settingsUpdatedAt`—which removes nothing on
                 // screen and so leaves `changed` false. It still has to be saved.
                 if (lastMergeAdopted) absorbed = true;
                 applyingRemoteState = false;
                 downloadComplete = !answer.more;
+                if (reconciling && downloadComplete) {
+                    reconciling = false;
+                    outgoing = reconcileWith(pulledAt, tag);
+                }
                 if (!outgoing.length && downloadComplete) break;
             }
+            // The page budget ran out before the store was fully downloaded, so what it
+            // lacks is not known yet: everything held is listed as unsent for it.
+            if (reconciling) {
+                localChangesSince(0).forEach(change => noteLocalChange(change.kind, change.key, change.at));
+            }
 
+            forgetReconciled(tag);
             // The rows and the place they reach go into storage in the same write.
             const naming = !legacy && !historyId;
             if (naming) historyId = makeHistoryId();
@@ -2875,11 +2957,14 @@
             pruneVisited();
             // Everything restored goes up, and the journal carries it until the main
             // document does.
-            for (const [url, at] of visited) noteLocalChange('v', url, at);
-            for (const [url] of overrides) noteLocalChange('o', url, overrideTimes.get(url) || 0);
-            const oldest = [...visited.values(), ...overrideTimes.values()]
-                .reduce((least, at) => (least ? Math.min(least, at) : at), 0);
-            lowerJournalSince(oldest);
+            for (const [url, at] of visited) {
+                noteLocalChange('v', url, at);
+                journalExtras.add(`v|${url}`);
+            }
+            for (const [url] of overrides) {
+                noteLocalChange('o', url, overrideTimes.get(url) || 0);
+                journalExtras.add(`o|${url}`);
+            }
             persistState();
             setRootState();
             processAllCards();
