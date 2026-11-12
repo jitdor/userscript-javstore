@@ -169,9 +169,11 @@
     // which the worker takes as already known.
     let outbox = new Map();
     // Entries this page took on from outside local storage—rows pulled from the worker, a
-    // restored backup—which its journal carries whatever their age. A journal reaching
-    // back in time instead would carry everything stamped since the oldest of them.
-    const journalExtras = new Set();
+    // restored backup—which its journal carries whatever their age, keyed to the journal
+    // key that first carried them. A journal reaching back in time instead would carry
+    // everything stamped since the oldest of them.
+    const journalExtras = new Map();
+    let journalGeneration = 0;
     let settingsUpdatedAt = 0;
     // When each setting was last changed on purpose, keyed by setting name. Settings merge
     // field by field on these, so changing one setting on one device does not carry that
@@ -483,8 +485,9 @@
     // - Without notice of other tabs' writes, only a tab that loaded less than
     //   FRESH_TAB_MS ago writes the main document. An older one writes its journal only.
     // - A page writes each journal key for JOURNAL_ROTATE_MS at most and then moves on to
-    //   a new one that carries everything the old one did, so a key that is old enough is
-    //   final: any tab that loaded later holds all of it.
+    //   a new one, so a key that is old enough is final: any tab that loaded later holds
+    //   all of it. A page never removes its own keys; a final key stays in storage until
+    //   the rule below removes it, so the next key only has to overlap it.
     // - A journal is removed only once it is final, the main document this tab loaded
     //   from storage already covers it, and JOURNAL_TTL_MS have passed since its last
     //   write, which leaves no tab that might lack it still allowed to write the main
@@ -656,9 +659,9 @@
 
     // Entries this page adopted with a timestamp from the past—a replayed click, rows
     // pulled from the worker, a restored backup—exist nowhere else in local storage yet,
-    // so the journal has to reach back far enough to carry them. It never stops carrying
-    // them while the page is open: on AdGuard a page cannot tell whether its own write of
-    // the main document survived another tab writing an older one.
+    // so the journal has to reach back far enough to carry them. A journal key that has
+    // carried them stays in storage until a newer tab finds them in the main document,
+    // which is what lets later keys leave them out (see writeJournal).
     function lowerJournalSince(at) {
         const time = parseTimestamp(at);
         if (time && time < journalSince) journalSince = time;
@@ -715,6 +718,21 @@
 
     async function writeJournal(writtenAt) {
         if (!journalingAvailable()) return null;
+        // A key is named for the moment it is first written, so its name says when it can
+        // last have been written. One written long enough is left as it is, final, and the
+        // page moves to a new key. The old one is not removed here: it stays until a newer
+        // tab finds it in the main document. The new key overlaps it by the span of the
+        // key it replaces—so a last write of the old key that never landed (AdGuard does
+        // not say) is still covered—and leaves anything older to the keys that hold it, so
+        // a long-open page's journal stays as small as its last few minutes.
+        const rotating = journalWritten && writtenAt - journalCreatedAt > JOURNAL_ROTATE_MS;
+        if (rotating) {
+            journalSince = Math.max(journalSince, journalCreatedAt);
+            for (const [id, generation] of journalExtras) {
+                if (generation < journalGeneration) journalExtras.delete(id);
+            }
+            journalGeneration += 1;
+        }
         const journal = serializeJournal(writtenAt);
         const carries = Object.keys(journal.visited).length
             || Object.keys(journal.tombstones).length
@@ -724,12 +742,7 @@
             || resetAt >= journalSince
             || settingsUpdatedAt >= journalSince;
         if (!carries) return null;
-        // A key is named for the moment it is first written, so its name says when it can
-        // last have been written. One written long enough is left as it is, final, and the
-        // page moves to a new key that carries everything the old one did. The old one is
-        // not removed here: if the new write never lands (AdGuard does not say), it is the
-        // only copy. It goes once a newer tab finds it in the main document.
-        if (!journalWritten || writtenAt - journalCreatedAt > JOURNAL_ROTATE_MS) {
+        if (!journalWritten || rotating) {
             journalCreatedAt = writtenAt;
             journalKey = makeJournalKey(journalCreatedAt);
         }
@@ -2067,7 +2080,7 @@
                 (Array.isArray(answer.changes) ? answer.changes : []).forEach(row => {
                     if (!row || typeof row !== 'object' || !row.key) return;
                     const id = `${row.kind === 'o' ? 'o' : 'v'}|${row.key}`;
-                    journalExtras.add(id);
+                    journalExtras.set(id, journalGeneration);
                     if (reconciling) pulledAt.set(id, Math.max(pulledAt.get(id) || 0, parseTimestamp(row.at)));
                 });
                 // A batch can carry nothing but protective metadata—a tombstone, a newer
@@ -2959,11 +2972,11 @@
             // document does.
             for (const [url, at] of visited) {
                 noteLocalChange('v', url, at);
-                journalExtras.add(`v|${url}`);
+                journalExtras.set(`v|${url}`, journalGeneration);
             }
             for (const [url] of overrides) {
                 noteLocalChange('o', url, overrideTimes.get(url) || 0);
-                journalExtras.add(`o|${url}`);
+                journalExtras.set(`o|${url}`, journalGeneration);
             }
             persistState();
             setRootState();

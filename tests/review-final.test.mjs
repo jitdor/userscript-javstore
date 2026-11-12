@@ -209,3 +209,37 @@ test('R5 a journal rotation whose new key never lands does not delete the key it
     await settle();
     assert.ok(isVisited(fresh, '/a.html'), 'the visit stored before the failed write is still stored');
 });
+
+// Codex review on #23: a tab that pulled a large history carried every pulled row in every
+// later journal write, and since a page never removes its own keys, a long-open tab left a
+// full-size key behind every few minutes. Each key now overlaps only the one it replaces;
+// the rows stay in the final key that first carried them until a newer tab retires it.
+test('a long-open tab that pulled a large history writes small journals a few rotations later', async () => {
+    const now = Date.now();
+    const remote = makeRemote();
+    const changes = [];
+    for (let i = 0; i < 3000; i++) {
+        changes.push({ kind: 'v', key: `https://javstore.net/${600000 + i}-FC2-PPV-${3000000 + i}-pn.html`, at: now - 86400000 + i });
+    }
+    remote.store.sync({ cursor: 0, changes });
+    const { store, clock, open } = device();
+    enableSync(store, remote);
+    const tab = await open({ remote });
+    await waitFor(() => store.read(SESSION_KEY)?.completedAt, { timeout: 20000 });
+    await settle(100);
+    const largest = () => Math.max(0, ...store.journals().map(key => store.data.get(key).length));
+    assert.ok(largest() > 100000, 'the pulled rows are journaled at first');
+    const firstKeys = new Set(store.journals());
+
+    for (const minutes of [6, 12]) {
+        clock.offset = minutes * 60000;
+        pressOnCard(tab.window, minutes === 6 ? '/a.html' : '/b.html', 'v');
+        await settle(100);
+    }
+    const latest = store.journals().filter(key => !firstKeys.has(key))
+        .sort((a, b) => parseInt(b.split('_')[3], 36) - parseInt(a.split('_')[3], 36))[0];
+    assert.ok(latest, 'the page moved on to a new key');
+    assert.ok(store.data.get(latest).length < 20000,
+        `the latest journal is ${(store.data.get(latest).length / 1024).toFixed(0)} KB`);
+    assert.ok([...firstKeys].every(key => store.journals().includes(key)), 'the key holding the rows stays');
+});
