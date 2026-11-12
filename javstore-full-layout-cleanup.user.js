@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         JavStore Full Layout Cleanup - No Sidebars + Mosaic Overlay
 // @namespace    http://tampermonkey.net/
-// @version      6.11.0
+// @version      6.11.1
 // @description  Clean up JavStore's layout, filter keyword-matched thumbnails, and track visited items with private, configurable controls.
 // @homepageURL  https://github.com/jitdor/userscript-javstore
 // @supportURL   https://github.com/jitdor/userscript-javstore/issues
@@ -29,7 +29,7 @@
 (function () {
     'use strict';
 
-    const SCRIPT_VERSION = '6.11.0';
+    const SCRIPT_VERSION = '6.11.1';
     // The same address as @downloadURL: opening it hands the newest release to the
     // userscript manager, which offers to install it.
     const INSTALL_URL = 'https://github.com/jitdor/userscript-javstore/releases/latest/download/javstore-full-layout-cleanup.user.js';
@@ -128,6 +128,14 @@
     // configuration records the id the cursor belongs to, so a history that no longer
     // carries it—wiped, unreadable, or written before ids existed—is downloaded in full.
     let historyId = '';
+    // How far into the worker's history this document is complete: every row up to
+    // `cursor` on the worker `remote` names (by a hash of its endpoint, which itself stays
+    // out of the history) is already merged into it. It is saved in the same
+    // write as the rows it describes, so the two cannot disagree. A cursor kept only in the
+    // sync configuration could: an engine that hands each tab the storage it had when the
+    // tab loaded (AdGuard does) lets a long-open tab write back an older history while the
+    // configuration still claims everything up to a later row is on the device.
+    let syncedThrough = { remote: '', cursor: 0 };
     let settingsUpdatedAt = 0;
     // When each setting was last changed on purpose, keyed by setting name. Settings merge
     // field by field on these, so changing one setting on one device does not carry that
@@ -650,6 +658,7 @@
             resetAt,
             prunedBefore,
             ...(historyId ? { historyId } : {}),
+            ...(syncedThrough.remote ? { syncedThrough: { ...syncedThrough } } : {}),
             settings: { ...settings },
             visited: Object.fromEntries(visited),
             overrides: Object.fromEntries(overrides),
@@ -822,6 +831,7 @@
                 const snapshot = await readStorageSnapshot();
                 const combined = combineSnapshot(snapshot);
                 adoptHistoryId(combined);
+                adoptSyncedThrough(combined);
                 mergeStoredState(combined);
                 notePushBacklog();
                 pruneVisited();
@@ -1252,6 +1262,41 @@
         if (id) historyId = id;
     }
 
+    function remoteTag(endpoint) {
+        if (!endpoint) return '';
+        let hash = 0x811c9dc5;
+        for (let index = 0; index < endpoint.length; index += 1) {
+            hash ^= endpoint.charCodeAt(index);
+            hash = Math.imul(hash, 0x01000193) >>> 0;
+        }
+        return hash.toString(16).padStart(8, '0');
+    }
+
+    function parseSyncedThrough(value) {
+        const remote = typeof value?.remote === 'string' ? value.remote.slice(0, 40) : '';
+        const cursor = clamp(value?.cursor, 0, Number.MAX_SAFE_INTEGER, 0);
+        return remote && cursor ? { remote, cursor } : { remote: '', cursor: 0 };
+    }
+
+    // Like the history id, only ever taken from this device's own storage, and only at the
+    // points where a stored document is merged into this tab's: the merged history holds
+    // everything both copies held, so it is complete as far as the further of the two.
+    function adoptSyncedThrough(stored) {
+        const theirs = parseSyncedThrough(stored?.syncedThrough);
+        if (!theirs.remote) return;
+        if (theirs.remote === syncedThrough.remote) {
+            if (theirs.cursor > syncedThrough.cursor) syncedThrough = theirs;
+        } else if (syncedThrough.remote !== remoteTag(syncConfig.endpoint)) {
+            syncedThrough = theirs;
+        }
+    }
+
+    // Exports and the legacy worker get the history without this device's place in it.
+    function portableState() {
+        const { syncedThrough: _local, ...state } = serializeState();
+        return state;
+    }
+
     function syncConfigured() {
         return syncConfig.enabled && Boolean(syncConfig.endpoint);
     }
@@ -1590,6 +1635,7 @@
             const needsCheckpoint = journalsAhead(snapshot);
             if (!storageAvailable) throw new Error('local history could not be read');
             adoptHistoryId(stored);
+            adoptSyncedThrough(stored);
             applyStoredState(stored);
             pruneVisited();
 
@@ -1600,14 +1646,25 @@
             // A history that has lost it pulls everything again; the worker settles each row
             // on its timestamp, so rows the device still holds cost bandwidth and nothing else.
             const sameHistory = Boolean(historyId) && syncConfig.historyId === historyId;
-            const recovering = sameRemote && syncConfig.cursor > 0 && !sameHistory;
+            // Where this history is complete up to, as the history itself records it. A
+            // document saved before it carried that falls back to the configuration's
+            // cursor when the two name the same history.
+            const stamped = syncedThrough.remote === remoteTag(syncConfig.endpoint) ? syncedThrough.cursor : 0;
+            const held = stamped || (sameRemote && sameHistory && !syncedThrough.remote ? syncConfig.cursor : 0);
+            // Only a history with no place in the sync at all, on a device that has synced
+            // before, has actually been lost. One that is merely behind—an older copy written
+            // back by a tab that had been open a long time—picks up from where it is, quietly.
+            const recovering = sameRemote && syncConfig.cursor > 0 && !held;
             const heldBefore = visited.size;
-            let cursor = sameRemote && sameHistory ? syncConfig.cursor : 0;
+            let cursor = held;
             const pushedAt = sameRemote ? syncConfig.pushedAt : 0;
             const session = await loadValue(SYNC_SESSION_KEY);
             const now = Date.now();
+            // The session only vouches for a history that still reaches as far as the
+            // download it records; one written back from an older copy has to catch up.
+            // Sessions recorded before they carried a cursor vouch for nothing.
             const currentSession = session?.endpoint === syncConfig.endpoint
-                && session?.historyId === historyId && sameHistory && sameRemote
+                && sameRemote && Number.isFinite(session?.cursor) && held >= session.cursor
                 && session?.completedAt > 0 && now - session.activeAt < SYNC_SESSION_IDLE_MS;
             if (!manual && currentSession) {
                 const pending = localChangesSince(pushedAt).length
@@ -1655,7 +1712,7 @@
                 if (answer.state && typeof answer.state === 'object' && answer.cursor === undefined) {
                     legacy = true;
                     downloadComplete = true;
-                    const echoed = await requestRemote({ client: SCRIPT_VERSION, state: serializeState() });
+                    const echoed = await requestRemote({ client: SCRIPT_VERSION, state: portableState() });
                     const document = echoed?.state && typeof echoed.state === 'object' ? echoed.state : answer.state;
                     if (applyStoredState(document)) changed = true;
                     if (lastMergeAdopted) absorbed = true;
@@ -1690,8 +1747,12 @@
             // cursor is recorded against it, for the same reason as the rows above.
             const naming = !legacy && !historyId;
             if (naming) historyId = makeHistoryId();
+            // The rows and the place they reach go into storage in the same write.
+            const reached = legacy ? { remote: '', cursor: 0 } : parseSyncedThrough({ remote: remoteTag(syncConfig.endpoint), cursor });
+            const advanced = reached.remote !== syncedThrough.remote || reached.cursor !== syncedThrough.cursor;
+            syncedThrough = reached;
             applyingRemoteState = true;
-            const saved = (changed || absorbed || naming || needsCheckpoint) ? await persistState() : true;
+            const saved = (changed || absorbed || naming || needsCheckpoint || advanced) ? await persistState() : true;
             applyingRemoteState = false;
             if (!saved) throw new Error('the merged history could not be saved');
 
@@ -1721,7 +1782,7 @@
             // page budget was exhausted, the next page must continue from the saved cursor.
             if (downloadComplete) {
                 await storeValue(SYNC_SESSION_KEY, {
-                    endpoint: syncConfig.endpoint, historyId, uploadedMeta, workerVersion: remoteWorkerVersion,
+                    endpoint: syncConfig.endpoint, historyId, cursor, uploadedMeta, workerVersion: remoteWorkerVersion,
                     completedAt: Date.now(), activeAt: Date.now(),
                 });
             }
@@ -2493,7 +2554,7 @@
     }
 
     function exportState() {
-        const payload = JSON.stringify(serializeState(), null, 2);
+        const payload = JSON.stringify(portableState(), null, 2);
         const blob = new Blob([payload], { type: 'application/json' });
         const url = URL.createObjectURL(blob);
         const anchor = document.createElement('a');
@@ -2863,6 +2924,7 @@
 
     function reloadRemoteState(newValue) {
         adoptHistoryId(newValue);
+        adoptSyncedThrough(newValue);
         if (applyStoredState(newValue)) showToast('Settings synchronized from another tab.');
     }
 
@@ -2873,6 +2935,7 @@
         if (document.visibilityState === 'hidden') return;
         const stored = await readStoredState();
         adoptHistoryId(stored);
+        adoptSyncedThrough(stored);
         applyStoredState(stored);
     }
 
@@ -2962,6 +3025,7 @@
         resetAt = parseTimestamp(initialState?.resetAt);
         prunedBefore = parseTimestamp(initialState?.prunedBefore);
         historyId = parseHistoryId(initialState?.historyId);
+        syncedThrough = parseSyncedThrough(initialState?.syncedThrough);
         lastKnownUpdatedAt = parseTimestamp(initialState?.updatedAt);
         settingsUpdatedAt = parseTimestamp(initialState?.settingsUpdatedAt) || lastKnownUpdatedAt;
         settingTimes = documentSettingTimes(initialState);

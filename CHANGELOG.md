@@ -1,5 +1,13 @@
 # Changelog
 
+## 6.11.1
+
+- Fix: on AdGuard, "Restored N visited URLs from the worker" could appear on page after page while other JavStore tabs were open, and each time the device downloaded its whole history again. AdGuard gives every tab the storage it had when that tab loaded, and a tab never sees what other tabs save after that. So a tab left open for a while saves an older copy of the history, carrying the history id it was loaded with. After any loss of history (an AdGuard update wiping storage, for example), those old tabs and the newer ones kept swapping two ids. Every new page then took the mismatch for a lost history.
+- Fix: in the same situation with matching ids, an older copy written back by a long-open tab could lose visits for good. The sync bookmark still claimed the device held everything up to the newest row, so what the old copy lacked was never downloaded again.
+- Change: the history now records how far into the worker's history it is complete, in the same save as the visits themselves. The record names the worker by a hash, never by its address. A page that finds an older copy catches up from where that copy reaches, quietly and only for the difference. The note and the full download are left for a history that has really been lost. Histories saved by 6.11.0 or earlier keep using the bookmark from the sync settings until their next sync.
+- Tabs that were already open before updating keep running the code they loaded with, so the note can still appear until they are reloaded or closed.
+- The worker version moves to 6.11.1 with the userscript; the worker is unchanged.
+
 ## 6.11.0
 
 - Share initial cloud sync across a browsing session: page navigation and new tabs reuse locally stored history instead of starting another download. Sessions expire after 30 minutes without startup/sync activity; a new session resumes from the durable cursor.

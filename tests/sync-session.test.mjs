@@ -2,7 +2,7 @@ import test, { afterEach } from 'node:test';
 import assert from 'node:assert/strict';
 import {
     makeStore, makeRemote, enableSync, openTab, closeTabs, settle, waitFor,
-    listingHtml, detailHtml, card, visitedUrls,
+    listingHtml, detailHtml, card, pressOnCard, visitedUrls,
 } from './harness.mjs';
 
 const SESSION_KEY = 'javstore_sync_session_v1';
@@ -193,4 +193,47 @@ test('foreground tabs share periodic refresh and hidden tabs do not poll', async
     await settle();
     assert.equal(remote.requests.length, 2, 'only one foreground refresh');
     assert.equal(remote.responses.at(-1).changes.length, 0);
+});
+
+// AdGuard hands each tab the storage it had when the tab loaded. A tab left open that long
+// writes back an older history: one that lacks what other tabs and devices have since
+// added, and that carries whatever history id it was loaded with. The cursor used to live
+// only in the sync configuration, so the next page either took that older copy for a lost
+// history and downloaded everything with a "Restored" note—on every page, for as long as
+// the old tab kept writing—or, with the ids agreeing, trusted a cursor the copy did not
+// reach and lost the difference for good.
+test('an older history written back by a long-open tab catches up quietly from its own place', async () => {
+    const remote = seededRemote(300);
+    const store = makeStore({ snapshotPerTab: true });
+    await restored(remote, store);
+    const old = await openTab(store, { html: listing(), remote, url: 'https://javstore.net/page/1' });
+    const reachedByOld = store.read(CONFIG_KEY).cursor;
+
+    // Another device adds visits, then this device loses its history while the old tab
+    // stays open. The next page is a genuine recovery, and says so once.
+    const at = Date.now() - 30000;
+    remote.store.sync({ cursor: 0, changes: Array.from({ length: 30 }, (_, i) => ({
+        kind: 'v', key: `https://javstore.net/elsewhere-${i}.html`, at: at + i,
+    })) });
+    store.data.delete(STATE_KEY);
+    store.journals().forEach(key => store.data.delete(key));
+    let previous = store.read(SESSION_KEY).completedAt;
+    const first = await openTab(store, { html: listing(), remote, url: 'https://javstore.net/page/2' });
+    await waitFor(() => store.read(SESSION_KEY).completedAt > previous);
+    assert.match(first.shadow().textContent, /Restored 330 visited URLs/);
+    assert.equal(visitedUrls(store).length, 330);
+
+    // The old tab records a visit: its write puts back the history it loaded with.
+    pressOnCard(old.window, '/new.html', 'v');
+    await waitFor(() => visitedUrls(store).length === 301);
+
+    previous = store.read(SESSION_KEY).completedAt;
+    const requests = remote.requests.length;
+    const next = await openTab(store, { html: listing(), remote, url: 'https://javstore.net/page/3' });
+    await waitFor(() => store.read(SESSION_KEY).completedAt > previous);
+    assert.equal(remote.requests[requests].body.cursor, reachedByOld, 'it resumes where the older copy reaches');
+    assert.doesNotMatch(next.shadow().textContent, /Restored \d+ visited URLs/);
+    assert.equal(visitedUrls(store).length, 331);
+    assert.ok(visitedUrls(store).includes('https://javstore.net/elsewhere-0.html'));
+    assert.ok(visitedUrls(store).includes('https://javstore.net/new.html'));
 });

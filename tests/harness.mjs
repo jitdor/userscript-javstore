@@ -27,13 +27,20 @@ const openWindows = new Set();
 //
 // `dottedOnly` is the Userscripts app for Safari, which provides only the dotted GM4 API
 // (GM.getValue, GM.setValue, ...) and no GM_* functions at all.
-export function makeStore({ latency = 0, journaling = true, primitivesOnly = false, dottedOnly = false } = {}) {
+//
+// `snapshotPerTab` is AdGuard's behaviour across tabs: each tab reads the values storage
+// held when the tab loaded, plus its own writes. Writes still reach storage, so a tab
+// opened later sees them, but a tab that is already open never does.
+export function makeStore({
+    latency = 0, journaling = true, primitivesOnly = false, dottedOnly = false, snapshotPerTab = false,
+} = {}) {
     const data = new Map();
     const delay = () => (latency ? new Promise(resolve => setTimeout(resolve, Math.random() * latency)) : null);
     return {
         data,
         journaling,
         dottedOnly,
+        snapshotPerTab,
         dropWrites: false,
         // Storage that rejects the history document while still taking the small
         // bookkeeping values: that is the shape of a quota refusal, and the case where a
@@ -72,6 +79,30 @@ export function makeStore({ latency = 0, journaling = true, primitivesOnly = fal
         },
         state() {
             return this.read('javstore_cleanup_state_v2') ?? null;
+        },
+        // What one tab's GM calls see; see `snapshotPerTab`.
+        view() {
+            if (!snapshotPerTab) return this;
+            const store = this;
+            const seen = new Map(data);
+            return {
+                async get(key, fallback) {
+                    await delay();
+                    return seen.has(key) ? JSON.parse(seen.get(key)) : fallback;
+                },
+                async set(key, value) {
+                    await store.set(key, value);
+                    if (data.has(key)) seen.set(key, data.get(key));
+                },
+                async list() {
+                    await delay();
+                    return [...seen.keys()];
+                },
+                async delete(key) {
+                    await store.delete(key);
+                    seen.delete(key);
+                },
+            };
         },
     };
 }
@@ -229,22 +260,23 @@ export async function openTab(store, {
             removeItem: key => session.delete(key),
         },
     });
+    const gm = store.view ? store.view() : store;
     if (store.dottedOnly) {
         window.GM = {
-            getValue: (key, fallback) => store.get(key, fallback),
-            setValue: (key, value) => store.set(key, value),
+            getValue: (key, fallback) => gm.get(key, fallback),
+            setValue: (key, value) => gm.set(key, value),
             addStyle: async () => {},
         };
         if (store.journaling !== false) {
-            window.GM.listValues = () => store.list();
-            window.GM.deleteValue = key => store.delete(key);
+            window.GM.listValues = () => gm.list();
+            window.GM.deleteValue = key => gm.delete(key);
         }
     } else {
-        window.GM_getValue = (key, fallback) => store.get(key, fallback);
-        window.GM_setValue = (key, value) => store.set(key, value);
+        window.GM_getValue = (key, fallback) => gm.get(key, fallback);
+        window.GM_setValue = (key, value) => gm.set(key, value);
         if (store.journaling !== false) {
-            window.GM_listValues = () => store.list();
-            window.GM_deleteValue = key => store.delete(key);
+            window.GM_listValues = () => gm.list();
+            window.GM_deleteValue = key => gm.delete(key);
         }
         window.GM_addStyle = () => {};
     }
