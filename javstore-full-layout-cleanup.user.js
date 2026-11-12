@@ -3029,6 +3029,20 @@
         lastKnownUpdatedAt = parseTimestamp(initialState?.updatedAt);
         settingsUpdatedAt = parseTimestamp(initialState?.settingsUpdatedAt) || lastKnownUpdatedAt;
         settingTimes = documentSettingTimes(initialState);
+        // combineSnapshot carries removals along without applying them, and a journal can
+        // still hold a visit that was unmarked or cleared after it was written. Apply them
+        // here by the same rules as mergeStoredState, or the page paints those visits and
+        // its first save writes them back next to their own tombstones.
+        for (const [url, at] of visited) {
+            if (at <= resetAt || at <= prunedBefore || at <= tombstoneTime('v', url)) visited.delete(url);
+        }
+        for (const url of [...overrides.keys()]) {
+            const removedAt = tombstoneTime('o', url);
+            if (removedAt && (overrideTimes.get(url) || 0) <= removedAt) {
+                overrides.delete(url);
+                overrideTimes.delete(url);
+            }
+        }
     }
 
     async function boot() {
