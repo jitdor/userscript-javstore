@@ -32,7 +32,9 @@ const openWindows = new Set();
 // held when the tab loaded, plus its own writes. Writes still reach storage, so a tab
 // opened later sees them, but a tab that is already open never does.
 export function makeStore({
-    latency = 0, journaling = true, primitivesOnly = false, dottedOnly = false, snapshotPerTab = false,
+    latency = 0, journaling = true, primitivesOnly = false,
+    // JVS_DOTTED=1 runs every suite against the Userscripts app's API shape.
+    dottedOnly = process.env.JVS_DOTTED === '1', snapshotPerTab = false,
 } = {}) {
     const data = new Map();
     const delay = () => (latency ? new Promise(resolve => setTimeout(resolve, Math.random() * latency)) : null);
