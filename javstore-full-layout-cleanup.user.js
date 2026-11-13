@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         JavStore Full Layout Cleanup - No Sidebars + Mosaic Overlay
 // @namespace    http://tampermonkey.net/
-// @version      6.12.0
+// @version      6.13.0
 // @description  Clean up JavStore's layout, filter keyword-matched thumbnails, and track visited items with private, configurable controls.
 // @homepageURL  https://github.com/jitdor/userscript-javstore
 // @supportURL   https://github.com/jitdor/userscript-javstore/issues
@@ -29,7 +29,7 @@
 (function () {
     'use strict';
 
-    const SCRIPT_VERSION = '6.12.0';
+    const SCRIPT_VERSION = '6.13.0';
     // The same address as @downloadURL: opening it hands the newest release to the
     // userscript manager, which offers to install it.
     const INSTALL_URL = 'https://github.com/jitdor/userscript-javstore/releases/latest/download/javstore-full-layout-cleanup.user.js';
@@ -69,6 +69,7 @@
     const SYNC_LEASE_KEY = 'javstore_sync_lease_v1';
     const SYNC_SESSION_IDLE_MS = 30 * 60000;
     const SYNC_LEASE_MS = 90000;
+    const SYNC_LOCK_NAME = 'javstore-cloud-sync-v1';
     // The longest one exchange may hold the sync lock. Its requests time out long before;
     // this is for whatever else could hang, so one stuck tab cannot stop every tab syncing.
     const SYNC_HOLD_MS = 5 * 60000;
@@ -196,6 +197,21 @@
     let remoteWorkerVersion = '';
     let lastRemoteError = '';
     let remoteSyncRunning = false;
+    // What the on-page sync status shows. A tab cannot read another tab's progress from
+    // storage on AdGuard, but every tab of the site shares the sync's Web Lock, and asking
+    // the browser whether it is held needs no storage at all.
+    const syncView = {
+        waitingSince: 0, // this tab's sync is queued behind another tab's
+        exchangeSince: 0, // this tab is talking to the worker
+        rows: 0, // rows this exchange has downloaded so far
+        downloading: false, // more of the history is still to come
+        otherTab: false, // another tab holds the sync lock
+        heldPolls: 0,
+        shown: false,
+        doneUntil: 0,
+        timer: 0,
+        pollTimer: 0,
+    };
     let applyingRemoteState = false;
     // A merge can absorb protective metadata—a tombstone, a newer `resetAt`, `prunedBefore`
     // or `settingsUpdatedAt`—without removing anything that is on screen, so
@@ -1855,7 +1871,18 @@
     // Syncs are queued for the same reason writes are: two overlapping merge cycles would
     // each build on a snapshot the other has already moved past.
     function queueSync(options = {}) {
-        const run = () => withSyncLock(() => runSync(options));
+        const run = () => {
+            const queuedAt = Date.now();
+            syncView.waitingSince = queuedAt;
+            refreshLiveSync();
+            return withSyncLock(() => {
+                syncView.waitingSince = 0;
+                return runSync(options);
+            }).finally(() => {
+                if (syncView.waitingSince === queuedAt) syncView.waitingSince = 0;
+                refreshLiveSync();
+            });
+        };
         remoteQueue = remoteQueue.then(run, run).catch(error => {
             lastRemoteError = String(error?.message || 'sync failed');
             if (options.manual) showToast(`Sync failed: ${lastRemoteError}`, true);
@@ -1877,7 +1904,7 @@
         // cannot stop every other tab from syncing. Its requests time out well before.
         const bounded = () => withTimeout(action(), SYNC_HOLD_MS, 'the sync took too long');
         if (navigator.locks?.request) {
-            return navigator.locks.request('javstore-cloud-sync-v1', async () => {
+            return navigator.locks.request(SYNC_LOCK_NAME, async () => {
                 if (pageClosed) return false;
                 return bounded();
             });
@@ -2013,6 +2040,10 @@
             let downloadComplete = false;
             let uploadedMeta = '';
             let restarted = false;
+            syncView.exchangeSince = Date.now();
+            syncView.rows = 0;
+            syncView.downloading = reconciling;
+            refreshLiveSync();
 
             for (let page = 0; page < MAX_SYNC_PAGES; page += 1) {
                 const batch = outgoing.slice(0, REMOTE_PAGE_ROWS);
@@ -2089,6 +2120,9 @@
                 if (lastMergeAdopted) absorbed = true;
                 applyingRemoteState = false;
                 downloadComplete = !answer.more;
+                syncView.rows += Array.isArray(answer.changes) ? answer.changes.length : 0;
+                syncView.downloading = Boolean(answer.more);
+                refreshLiveSync();
                 if (reconciling && downloadComplete) {
                     reconciling = false;
                     outgoing = reconcileWith(pulledAt, tag);
@@ -2147,6 +2181,14 @@
             if (manual) showToast(`Sync failed: ${lastRemoteError}`, true);
             return false;
         } finally {
+            if (syncView.exchangeSince) {
+                syncView.exchangeSince = 0;
+                syncView.downloading = false;
+                // A sync the user saw running says when it is over, so they know new tabs
+                // will start from the downloaded history.
+                if (syncView.shown) syncView.doneUntil = Date.now() + 3000;
+                refreshLiveSync();
+            }
             applyingRemoteState = false;
             remoteSyncRunning = false;
             if (deferredRemotePush) {
@@ -2241,6 +2283,82 @@
         if (minutes < 1) return 'synced just now';
         if (minutes < 60) return `synced ${minutes} min ago`;
         return `synced at ${new Date(lastRemoteSyncAt).toLocaleTimeString()}`;
+    }
+
+    // Shown only once a sync has taken longer than a moment, so quick syncs do not flicker.
+    const LIVE_SYNC_DELAY_MS = 600;
+
+    function describeLiveSync(now = Date.now()) {
+        if (!syncConfigured()) return null;
+        const rows = syncView.rows ? ` ${syncView.rows.toLocaleString()} visits` : '';
+        if (syncView.exchangeSince && now - syncView.exchangeSince >= LIVE_SYNC_DELAY_MS) {
+            return syncView.downloading
+                ? { text: `Downloading history…${rows}`, busy: true, hint: true }
+                : { text: `Syncing…${rows}`, busy: true, hint: false };
+        }
+        if (syncView.waitingSince && now - syncView.waitingSince >= LIVE_SYNC_DELAY_MS) {
+            return { text: 'Waiting for another tab to sync…', busy: true, hint: true };
+        }
+        if (syncView.otherTab) return { text: 'Another tab is syncing…', busy: true, hint: true };
+        if (syncView.doneUntil > now) return { text: 'Sync complete', busy: false, hint: false };
+        return null;
+    }
+
+    function renderLiveSync() {
+        if (!ui?.syncStatus) return;
+        const now = Date.now();
+        const status = describeLiveSync(now);
+        syncView.shown = Boolean(status?.busy);
+        ui.syncStatus.hidden = !status;
+        if (!status) return;
+        ui.syncStatus.textContent = status.text;
+        ui.syncStatus.classList.toggle('busy', status.busy);
+        ui.syncStatus.title = status.hint
+            ? 'Tabs opened before this finishes start without what it downloads, and download it again themselves. Wait for "Sync complete" before opening new tabs.'
+            : '';
+    }
+
+    // Renders now, and again once the delay has passed or the "complete" note has run out.
+    function refreshLiveSync() {
+        renderLiveSync();
+        window.clearTimeout(syncView.timer);
+        const now = Date.now();
+        const pending = [
+            syncView.exchangeSince && syncView.exchangeSince + LIVE_SYNC_DELAY_MS,
+            syncView.waitingSince && syncView.waitingSince + LIVE_SYNC_DELAY_MS,
+            syncView.doneUntil,
+        ].filter(at => at && at > now);
+        if (pending.length) syncView.timer = window.setTimeout(refreshLiveSync, Math.min(...pending) - now + 20);
+    }
+
+    // Whether another tab holds the sync lock, asked of the browser every couple of seconds
+    // while this tab is in view. A lock held for a moment is an ordinary quick sync, so it
+    // only counts once two checks in a row find it held.
+    async function pollOtherTabSync() {
+        if (!syncConfigured() || document.visibilityState === 'hidden' || typeof navigator.locks?.query !== 'function') {
+            syncView.heldPolls = 0;
+        } else {
+            try {
+                const { held = [] } = await navigator.locks.query();
+                const ours = remoteSyncRunning || syncView.waitingSince;
+                const heldElsewhere = !ours && held.some(lock => lock.name === SYNC_LOCK_NAME);
+                syncView.heldPolls = heldElsewhere ? syncView.heldPolls + 1 : 0;
+            } catch (error) {
+                syncView.heldPolls = 0;
+            }
+        }
+        const otherTab = syncView.heldPolls >= 2;
+        if (otherTab !== syncView.otherTab) {
+            if (syncView.otherTab && !otherTab) syncView.doneUntil = Date.now() + 3000;
+            syncView.otherTab = otherTab;
+            refreshLiveSync();
+        }
+    }
+
+    function startOtherTabPolling() {
+        window.clearInterval(syncView.pollTimer);
+        if (typeof navigator.locks?.query !== 'function') return;
+        syncView.pollTimer = window.setInterval(pollOtherTabSync, 2000);
     }
 
     settings = sanitizeSettings();
@@ -3034,6 +3152,14 @@
                 .warning { padding: 8px; border-radius: 8px; color: #fecaca; background: #7f1d1d; }
                 .warning a { color: #fff; }
                 .pill.update, .pill.redeploy { border-color: #fca5a5; background: #991b1b; }
+                .pill.sync-status { border-color: #86efac; background: #166534; }
+                .pill.sync-status.busy { border-color: #93c5fd; background: #1e3a8a; }
+                .pill.sync-status.busy::before {
+                    content: ''; display: inline-block; width: 10px; height: 10px; margin-right: 8px;
+                    border: 2px solid #bfdbfe; border-right-color: transparent; border-radius: 50%;
+                    vertical-align: -1px; animation: jvs-spin .8s linear infinite;
+                }
+                @keyframes jvs-spin { to { transform: rotate(360deg); } }
                 .pill.update:hover, .pill.redeploy:hover { background: #7f1d1d; }
                 .pill[hidden], .warning[hidden] { display: none; }
                 .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
@@ -3070,11 +3196,15 @@
                     .grid { grid-template-columns: 1fr; }
                     .full { grid-column: auto; }
                 }
-                @media (prefers-reduced-motion: reduce) { .toast { transition: none; } }
+                @media (prefers-reduced-motion: reduce) {
+                    .toast { transition: none; }
+                    .pill.sync-status.busy::before { animation: none; }
+                }
             </style>
             <div class="dock" aria-label="JavStore cleanup controls">
                 <button class="pill update" type="button" hidden>⚠ Update script</button>
                 <button class="pill redeploy" type="button" hidden>⚠ Redeploy worker</button>
+                <button class="pill sync-status" type="button" role="status" aria-live="polite" hidden></button>
                 <button class="pill lift" type="button">Reveal all</button>
                 <button class="pill summary" type="button" aria-expanded="false">JavStore controls</button>
             </div>
@@ -3164,6 +3294,7 @@
             storageWarning: shadow.querySelector('.storage-warning'),
             updateButton: shadow.querySelector('.update'),
             redeployButton: shadow.querySelector('.redeploy'),
+            syncStatus: shadow.querySelector('.sync-status'),
             updateWarning: shadow.querySelector('.update-warning'),
             updateVersions: shadow.querySelector('.update-versions'),
             selectedTitle: shadow.querySelector('.selected-title'),
@@ -3188,6 +3319,7 @@
         liftButton.addEventListener('click', toggleOverlays);
         shadow.querySelector('.update').addEventListener('click', () => setPanelOpen(true));
         shadow.querySelector('.redeploy').addEventListener('click', () => showToast(describeWorkerBehind(), true));
+        shadow.querySelector('.sync-status').addEventListener('click', () => setPanelOpen(true));
         form.addEventListener('submit', event => {
             event.preventDefault();
             applySettings(readSettingsForm());
@@ -3352,15 +3484,18 @@
         }
 
         restartSyncTimer();
+        startOtherTabPolling();
         window.addEventListener('pagehide', () => {
             pageClosed = true;
             window.clearInterval(remotePollTimer);
             window.clearTimeout(remotePushTimer);
+            window.clearInterval(syncView.pollTimer);
         });
         window.addEventListener('pageshow', event => {
             if (!event.persisted) return;
             pageClosed = false;
             restartSyncTimer();
+            startOtherTabPolling();
             if (!liveSync) syncTimer = window.setInterval(refreshFromStorage, SYNC_POLL_MS);
             queueSync({ reason: 'startup' });
         });
