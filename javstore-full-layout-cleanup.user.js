@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         JavStore Full Layout Cleanup - No Sidebars + Mosaic Overlay
 // @namespace    http://tampermonkey.net/
-// @version      6.13.0
+// @version      6.13.1
 // @description  Clean up JavStore's layout, filter keyword-matched thumbnails, and track visited items with private, configurable controls.
 // @homepageURL  https://github.com/jitdor/userscript-javstore
 // @supportURL   https://github.com/jitdor/userscript-javstore/issues
@@ -29,7 +29,7 @@
 (function () {
     'use strict';
 
-    const SCRIPT_VERSION = '6.13.0';
+    const SCRIPT_VERSION = '6.13.1';
     // The same address as @downloadURL: opening it hands the newest release to the
     // userscript manager, which offers to install it.
     const INSTALL_URL = 'https://github.com/jitdor/userscript-javstore/releases/latest/download/javstore-full-layout-cleanup.user.js';
@@ -401,12 +401,357 @@
         }
     }
 
-    async function loadValue(key) {
-        return decodeValue(await gmCall('getValue', key, null), key);
+    // ------------------------------------------------------------------
+    // Values too large to store in one piece
+    //
+    // AdGuard sends each GM_setValue to its app as one request, with the value URL-encoded
+    // in it, and a value too large for that request is not kept—without the script being
+    // told, and while the page that wrote it still reads it back from its own copy. Past a
+    // few hundred visits the history no longer fit, so on AdGuard it survived no page load
+    // at all, and every page downloaded it again with a "Restored N" note.
+    //
+    // So a value larger than the device keeps is stored as parts, each small enough, and
+    // then a short pointer to them under its own key. The pointer is written last: until it
+    // lands, whatever it replaces is still whole. A value whose parts are not all there is
+    // read as missing. How large a value this device keeps is measured on the device (see
+    // the storage probe below); until then parts stay small.
+    // ------------------------------------------------------------------
+
+    const PARTS_MARK = '__jvsParts';
+    const PART_KEY_PREFIX = 'javstore_part_';
+    // In URL-encoded characters: what any engine is assumed to keep until measured.
+    const DEFAULT_VALUE_LIMIT = 6000;
+    // What is assumed kept when the probe found nothing kept at all.
+    const MIN_VALUE_LIMIT = 1000;
+    // Values are cut to this share of the measured limit: the probe's values are plain
+    // letters, and the request that carries a value carries more than the value itself.
+    const VALUE_LIMIT_HEADROOM = 0.8;
+    // A part set nothing refers to is removed once it is this much older than the page
+    // that finds it: long enough for any pointer written after its parts to have landed.
+    const PART_RETIRE_MS = 2 * 60000;
+    let valueLimit = DEFAULT_VALUE_LIMIT;
+    let partSequence = 0;
+    let lastPartRetireAt = 0;
+    // Part sets this page has seen referred to, by their id.
+    const referencedParts = new Set();
+    // Keys whose parts were not all there when read, with when that pointer was written.
+    const incompleteValues = new Map();
+    // For each key, the part sets this page has read or written for it, oldest first.
+    const partSets = new Map();
+
+    function notePartSet(key, set) {
+        const sets = partSets.get(key) || [];
+        if (!set || !sets.some(known => known && known.id === set.id)) sets.push(set);
+        partSets.set(key, sets);
     }
 
-    function storeValue(key, value) {
-        return gmCall('setValue', key, JSON.stringify(value));
+    // Once a key has been written again, the part sets it used before are removed, all but
+    // the latest two: the new pointer names the one before it, which a reader falls back to
+    // if a part of the newest never landed. Every stored value is handed to each page
+    // AdGuard loads, so sets left behind would weigh on every page.
+    async function trimPartSets(key) {
+        const sets = partSets.get(key) || [];
+        while (sets.length > 2) {
+            const set = sets.shift();
+            if (!set) continue;
+            referencedParts.delete(set.id);
+            for (let index = 0; index < set.count; index += 1) {
+                await gmCall('deleteValue', partKey(set.id, index)).catch(() => {});
+            }
+        }
+    }
+
+    function encodedLength(text) {
+        try {
+            return encodeURIComponent(text).length;
+        } catch (error) {
+            return text.length * 9;
+        }
+    }
+
+    // What a value costs in the request that stores it, counted the stricter way: as if the
+    // manager encoded it as JSON before URL-encoding it, which turns each quote into `%5C%22`.
+    function wireLength(text) {
+        return encodedLength(JSON.stringify(text));
+    }
+
+    function valueBudget() {
+        return Number.isFinite(valueLimit) ? Math.max(200, Math.floor(valueLimit * VALUE_LIMIT_HEADROOM)) : Infinity;
+    }
+
+    // Pieces of `text` that each cost at most `limit`, cut between characters (never inside a
+    // surrogate pair, which encodeURIComponent rejects).
+    function splitEncoded(text, limit) {
+        const pieces = [];
+        let start = 0;
+        while (start < text.length) {
+            let length = Math.min(text.length - start, limit);
+            for (;;) {
+                let end = start + length;
+                const code = text.charCodeAt(end - 1);
+                if (end < text.length && code >= 0xd800 && code <= 0xdbff) end -= 1;
+                const size = wireLength(text.slice(start, end));
+                if (size <= limit || end - start <= 1) {
+                    length = end - start;
+                    break;
+                }
+                length = Math.max(1, Math.floor((end - start) * (limit / size) * 0.95));
+            }
+            pieces.push(text.slice(start, start + length));
+            start += length;
+        }
+        return pieces;
+    }
+
+    function partKey(id, index) {
+        return `${PART_KEY_PREFIX}${id}_${index}`;
+    }
+
+    // When a part set was written, from its id.
+    function partWrittenAt(id) {
+        const written = parseInt(String(id).split('-')[0], 36);
+        return Number.isFinite(written) ? written : 0;
+    }
+
+    function parseSetRef(value) {
+        if (!value || typeof value !== 'object') return null;
+        const id = typeof value.id === 'string' ? value.id : '';
+        const count = clamp(value.count, 0, 100000, 0);
+        const length = clamp(value.length, 0, Number.MAX_SAFE_INTEGER, 0);
+        return id && count ? { id, count, length } : null;
+    }
+
+    async function loadValue(key) {
+        const value = decodeValue(await gmCall('getValue', key, null), key);
+        if (!value || typeof value[PARTS_MARK] !== 'number') return value;
+        return assembleValue(key, value);
+    }
+
+    async function readPartSet(set) {
+        const pieces = await Promise.all(Array.from({ length: set.count }, (_, index) => gmCall('getValue', partKey(set.id, index), null)));
+        const text = pieces.every(piece => typeof piece === 'string') ? pieces.join('') : null;
+        return text !== null && text.length === set.length ? text : null;
+    }
+
+    // A pointer names its own part set and the complete one it replaced. If a part of the
+    // newest never landed, the one before is read instead: an older history, which the
+    // journals and the worker bring up to date, rather than none at all.
+    async function assembleValue(key, pointer) {
+        const current = parseSetRef({ id: pointer.id, count: pointer[PARTS_MARK], length: pointer.length });
+        const previous = parseSetRef(pointer.prev);
+        if (!current) return null;
+        // Oldest first, as writes record them.
+        [previous, current].filter(Boolean).forEach(set => {
+            referencedParts.add(set.id);
+            notePartSet(key, set);
+        });
+        let text = await readPartSet(current);
+        if (text === null && previous) {
+            text = await readPartSet(previous);
+            if (text !== null) {
+                // Still counted as incomplete: the newest parts may be on their way, and a
+                // save made from the older copy would replace what only they hold.
+                incompleteValues.set(key, partWrittenAt(current.id));
+                console.warn(`[JVS] Stored value ${key} is missing parts of its latest version; the one before is read.`);
+                return decodeValue(text, key);
+            }
+        }
+        if (text === null) {
+            incompleteValues.set(key, partWrittenAt(current.id));
+            console.warn(`[JVS] Stored value ${key} is missing some of its parts; it is read as missing.`);
+            return null;
+        }
+        incompleteValues.delete(key);
+        return decodeValue(text, key);
+    }
+
+    // Whether the stored history was found with parts missing that may still be on their
+    // way. Until that settles, this tab does not write over it.
+    function historyStillArriving() {
+        const writtenAt = incompleteValues.get(STORAGE_KEY);
+        return Boolean(writtenAt) && writtenAt > pageLoadedAt - 2 * STORAGE_SETTLE_MS;
+    }
+
+    // `prompt`: a save that is not made as the page is being left (a sync's), which needs no
+    // pause before its parts and should not hold the sync lock for one.
+    async function storeValue(key, value, { prompt = false } = {}) {
+        const text = JSON.stringify(value);
+        const budget = valueBudget();
+        if (wireLength(text) <= budget) {
+            await gmCall('setValue', key, text);
+            if (partSets.has(key)) {
+                notePartSet(key, null);
+                await trimPartSets(key);
+            }
+            return;
+        }
+        // A save made as the page is being left—a click on a card is one—would be cut off
+        // partway, leaving parts behind that nothing refers to. Parts wait a moment, and a
+        // page that is gone by then never writes them; the journal, written before this, and
+        // the replay note carry the change to the next page. (A page only frozen in the
+        // back/forward cache finishes the save if it is brought back.)
+        if (!prompt) await new Promise(resolve => window.setTimeout(resolve, 300));
+        partSequence += 1;
+        const id = `${Date.now().toString(36)}-${journalToken}${partSequence.toString(36)}`;
+        const pieces = splitEncoded(text, budget);
+        referencedParts.add(id);
+        await Promise.all(pieces.map((piece, index) => gmCall('setValue', partKey(id, index), piece)));
+        // A manager may deliver writes in any order, and a page that is left drops what has
+        // not gone yet. The pointer waits until the parts have had time to arrive: if the page
+        // is gone before then, the pointer is never written and the value before stays whole.
+        await new Promise(resolve => window.setTimeout(resolve, 100 + Math.ceil(wireLength(text) / 2000)));
+        const known = (partSets.get(key) || []).filter(Boolean);
+        const previous = known[known.length - 1];
+        await gmCall('setValue', key, JSON.stringify({
+            [PARTS_MARK]: pieces.length,
+            id,
+            length: text.length,
+            ...(previous?.length ? { prev: previous } : {}),
+        }));
+        notePartSet(key, { id, count: pieces.length, length: text.length });
+        await trimPartSets(key);
+    }
+
+    // Removes part sets no stored value refers to. Only those written well before this page
+    // loaded: one written since may belong to a value another tab is still storing, which
+    // this page cannot see (on AdGuard it never sees other tabs' writes).
+    async function retireParts() {
+        if (!journalingAvailable()) return;
+        lastPartRetireAt = Date.now();
+        let keys;
+        try {
+            keys = await gmCall('listValues');
+        } catch (error) {
+            return;
+        }
+        if (!Array.isArray(keys)) return;
+        const referenced = new Set(referencedParts);
+        await Promise.all(keys.filter(key => typeof key === 'string' && !key.startsWith(PART_KEY_PREFIX))
+            .map(async key => {
+                try {
+                    const value = decodeValue(await gmCall('getValue', key, null), key);
+                    if (value && typeof value[PARTS_MARK] === 'number') {
+                        if (typeof value.id === 'string') referenced.add(value.id);
+                        if (typeof value.prev?.id === 'string') referenced.add(value.prev.id);
+                    }
+                } catch (error) {
+                    // An unreadable value refers to nothing this page can tell.
+                }
+            }));
+        const stale = keys.filter(key => {
+            if (typeof key !== 'string' || !key.startsWith(PART_KEY_PREFIX)) return false;
+            const id = key.slice(PART_KEY_PREFIX.length).replace(/_\d+$/, '');
+            const written = partWrittenAt(id);
+            return !referenced.has(id) && written && written + PART_RETIRE_MS < pageLoadedAt;
+        });
+        for (const key of stale) {
+            try {
+                await gmCall('deleteValue', key);
+            } catch (error) {
+                // Left for a later page.
+            }
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Storage probe
+    //
+    // How large a value this device's userscript manager keeps is not documented for
+    // AdGuard, so it is measured: values of a few sizes are written, and the next page,
+    // which reads what storage actually kept, records the largest that came back. Managers
+    // that report other tabs' writes (Tampermonkey and the like) read storage itself and
+    // are not limited this way.
+    // ------------------------------------------------------------------
+
+    const PROBE_KEY = 'javstore_storage_probe_v1';
+    const PROBE_VALUE_PREFIX = 'javstore_probe_';
+    const PROBE_SIZES = [2000, 8000, 32000, 128000];
+    const PROBE_MAX_AGE_MS = 7 * 86400000;
+    let measuredValueLimit = 0;
+    let valueLimitMeasured = false;
+    // Reads what earlier pages measured, and decides what this page's probe step is. Writes
+    // nothing: startup writes wait until recovery has been read.
+    let probeStep = null;
+
+    function probeValue(token, size) {
+        return `${token}${'a'.repeat(Math.max(0, size - token.length))}`;
+    }
+
+    function useMeasuredLimit(limit) {
+        valueLimitMeasured = true;
+        measuredValueLimit = limit;
+        valueLimit = limit || MIN_VALUE_LIMIT;
+    }
+
+    async function measureValueLimit() {
+        if (liveStorage) {
+            valueLimit = Infinity;
+            return;
+        }
+        let probe = null;
+        try {
+            probe = decodeValue(await gmCall('getValue', PROBE_KEY, null), PROBE_KEY);
+        } catch (error) {
+            return;
+        }
+        const now = Date.now();
+        // Until a new measurement is in, the last one stands.
+        const last = clamp(probe?.limit ?? probe?.lastLimit, 0, Number.MAX_SAFE_INTEGER, 0);
+        if (last || probe?.measuredAt) useMeasuredLimit(last);
+        if (probe?.measuredAt && now - probe.measuredAt < PROBE_MAX_AGE_MS) return;
+        const token = typeof probe?.token === 'string' ? probe.token : '';
+        const startedAt = parseTimestamp(probe?.startedAt);
+        // A probe started a moment ago may still be on its way into storage; the next page
+        // judges it.
+        if (token && startedAt > pageLoadedAt - 5000) return;
+        // Written by an earlier page, so what comes back now is what storage kept. Tabs that
+        // load together each start a probe under the same keys; values that do not match the
+        // token that won only make the measurement lower, never higher.
+        if (token && startedAt) {
+            const kept = await Promise.all(PROBE_SIZES.map(async size => {
+                const value = await gmCall('getValue', `${PROBE_VALUE_PREFIX}${size}`, null).catch(() => null);
+                return value === probeValue(token, size) ? size : 0;
+            }));
+            const limit = Math.max(0, ...kept);
+            useMeasuredLimit(limit);
+            console.info(`[JVS] Userscript storage keeps values up to ${limit || 'none of the tested'} encoded characters.`);
+            probeStep = { record: { limit, measuredAt: now } };
+            return;
+        }
+        probeStep = { start: true, lastLimit: last };
+    }
+
+    // Records a finished measurement, or starts one for the next page to judge.
+    async function advanceStorageProbe() {
+        const step = probeStep;
+        probeStep = null;
+        if (!step) return;
+        try {
+            if (step.record) {
+                await gmCall('setValue', PROBE_KEY, JSON.stringify(step.record));
+                const keys = await gmCall('listValues').catch(() => []);
+                for (const key of Array.isArray(keys) ? keys : []) {
+                    if (typeof key === 'string' && key.startsWith(PROBE_VALUE_PREFIX)) {
+                        await gmCall('deleteValue', key).catch(() => {});
+                    }
+                }
+                return;
+            }
+            const token = Math.random().toString(36).slice(2, 10);
+            for (const size of PROBE_SIZES) {
+                await gmCall('setValue', `${PROBE_VALUE_PREFIX}${size}`, probeValue(token, size));
+            }
+            await gmCall('setValue', PROBE_KEY, JSON.stringify({ token, startedAt: Date.now(), lastLimit: step.lastLimit || 0 }));
+        } catch (error) {
+            // Measured on a later page.
+        }
+    }
+
+    function describeValueLimit() {
+        if (liveStorage) return '';
+        if (!valueLimitMeasured) return 'storage size limit not measured yet';
+        if (!measuredValueLimit) return 'storage kept none of the tested sizes (2 KB and up)';
+        return `storage keeps values up to ${Math.round(measuredValueLimit / 1000)} KB`;
     }
 
     async function readStoredState() {
@@ -762,7 +1107,8 @@
             journalCreatedAt = writtenAt;
             journalKey = makeJournalKey(journalCreatedAt);
         }
-        await storeValue(journalKey, journal);
+        // The journal is what carries a click to the next page, so it does not wait.
+        await storeValue(journalKey, journal, { prompt: true });
         journalWritten = true;
         return journal;
     }
@@ -961,16 +1307,31 @@
 
     // Writes are queued so two read-merge-write cycles can never interleave and drop each
     // other's changes on engines where GM_setValue resolves asynchronously.
-    function persistState({ journalOnly = false } = {}) {
-        const write = () => writeStoredState({ journalOnly });
-        writeQueue = writeQueue.then(write, write);
+    // A save that has not started yet takes in any asked for meanwhile: each writes all this
+    // page holds, so a burst of clicks needs one save after the one under way, not one each.
+    let queuedWrite = null;
+
+    function persistState({ journalOnly = false, prompt = false } = {}) {
         if (!journalOnly) scheduleRemotePush();
+        if (queuedWrite) {
+            queuedWrite.options.journalOnly = queuedWrite.options.journalOnly && journalOnly;
+            queuedWrite.options.prompt = queuedWrite.options.prompt || prompt;
+            return queuedWrite.promise;
+        }
+        const entry = { options: { journalOnly, prompt } };
+        const write = () => {
+            if (queuedWrite === entry) queuedWrite = null;
+            return writeStoredState(entry.options);
+        };
+        writeQueue = writeQueue.then(write, write);
+        entry.promise = writeQueue;
+        queuedWrite = entry;
         return writeQueue;
     }
 
     // `journalOnly` keeps the main document as it is: for a save that only records what
     // this page has sent, which no other copy depends on.
-    async function writeStoredState({ journalOnly = false } = {}) {
+    async function writeStoredState({ journalOnly = false, prompt = false } = {}) {
         const startedAt = Date.now();
         for (let attempt = 0; attempt < 2; attempt += 1) {
             try {
@@ -985,7 +1346,9 @@
                 // since does not write over the shared document; its journal carries its
                 // changes until a newer tab folds them in. Without journals there is
                 // nothing else to write to.
-                const shared = !journalingAvailable() || (!journalOnly && sharedWritesAllowed());
+                // Nor does one that found the stored history with parts still on their way.
+                const shared = !journalingAvailable()
+                    || (!journalOnly && sharedWritesAllowed() && !historyStillArriving());
                 const journal = await writeJournal(now);
                 if (!shared) {
                     lastSavedAt = Date.now();
@@ -996,7 +1359,7 @@
                     return true;
                 }
                 const payload = serializeState();
-                await storeValue(STORAGE_KEY, payload);
+                await storeValue(STORAGE_KEY, payload, { prompt });
                 // Read back rather than trusting the write: on engines that read storage
                 // itself, a value that never landed is exactly the failure that used to go
                 // unnoticed until the history was gone. (On AdGuard the read comes from the
@@ -1013,9 +1376,13 @@
                 storageAvailable = true;
                 clearPendingVisits(startedAt, verified);
                 await retireJournals(Date.now());
+                if (Date.now() - lastPartRetireAt > 60000) await retireParts();
                 scheduleCountUpdate();
                 return true;
             } catch (error) {
+                // A save stopped because the page is being left is not a storage failure: the
+                // journal and the replay note carry it to the next page.
+                if (pageClosed) return false;
                 if (attempt === 0) {
                     await new Promise(resolve => window.setTimeout(resolve, 300));
                     continue;
@@ -2145,7 +2512,7 @@
             // is far larger, is left as it is.
             const rewrite = changed || absorbed || naming || needsCheckpoint;
             applyingRemoteState = true;
-            const saved = await persistState({ journalOnly: !rewrite });
+            const saved = await persistState({ journalOnly: !rewrite, prompt: true });
             applyingRemoteState = false;
             if (!saved) throw new Error('the merged history could not be saved');
 
@@ -2860,7 +3227,9 @@
         const counts = getCounts();
         const capped = counts.stored >= MAX_VISITED_ITEMS ? ' (cap reached—oldest are dropped)' : '';
         ui.summary.textContent = `${counts.matched} matched · ${counts.visited} visited`;
-        ui.counts.textContent = `${counts.total} cards on this page · ${counts.stored} visited URLs stored${capped} · ${describeSaveState()} · ${describeSyncState()}`;
+        const limit = describeValueLimit();
+        const incomplete = incompleteValues.size ? ' · some stored values were missing parts' : '';
+        ui.counts.textContent = `${counts.total} cards on this page · ${counts.stored} visited URLs stored${capped} · ${describeSaveState()} · ${describeSyncState()}${limit ? ` · ${limit}` : ''}${incomplete}`;
         const workerVersion = describeWorkerVersion();
         ui.workerVersion.textContent = workerVersion;
         ui.workerVersion.hidden = !workerVersion;
@@ -3551,6 +3920,9 @@
         // Start independent reads together. Only the local working copy is needed
         // to paint tiles; sync configuration and recovery must not hold it up.
         const configPromise = readSyncConfig();
+        // How large a value this device keeps decides how anything large is written, so it
+        // is known before the first write; the reads below do not depend on it.
+        const limitPromise = measureValueLimit().catch(() => {});
         const journalsPromise = readJournals();
         const main = await readMainState();
         initializeState(main);
@@ -3560,7 +3932,7 @@
 
         // No writes or controls are enabled during the preview. Reconcile journals
         // before replay/migration so stale local data cannot overwrite recovery.
-        const [config, journals] = await Promise.all([configPromise, journalsPromise]);
+        const [config, journals] = await Promise.all([configPromise, journalsPromise, limitPromise]);
         syncConfig = config;
         const snapshot = { main, journals };
         loadedSnapshot = snapshot;
@@ -3571,7 +3943,7 @@
         processAllCards();
         await migrateLegacyHistory();
         if (replayed || journalsAhead(snapshot)) persistState();
-        retireJournals(Date.now());
+        retireJournals(Date.now()).then(retireParts).then(advanceStorageProbe).catch(() => {});
         setRootState();
 
         if (document.readyState === 'loading') {
