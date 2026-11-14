@@ -218,6 +218,7 @@ export function openInNewTabFromContextMenu(window, href) {
 }
 
 const deviceLocks = new WeakMap();
+const deviceLocksHeld = new WeakMap();
 
 export async function openTab(store, {
     html = listingHtml([]),
@@ -245,9 +246,22 @@ export async function openTab(store, {
         Object.defineProperty(window.navigator, 'locks', { value: {
             request(name, callback) {
                 const pending = deviceLocks.get(store) || Promise.resolve();
-                const next = pending.then(callback, callback);
+                const run = async () => {
+                    deviceLocksHeld.set(store, name);
+                    try {
+                        return await callback();
+                    } finally {
+                        deviceLocksHeld.delete(store);
+                    }
+                };
+                const next = pending.then(run, run);
                 deviceLocks.set(store, next.catch(() => {}));
                 return next;
+            },
+            // Like the real one, it says which locks any tab of the device holds.
+            async query() {
+                const name = deviceLocksHeld.get(store);
+                return { held: name ? [{ name, mode: 'exclusive' }] : [], pending: [] };
             },
         } });
     }

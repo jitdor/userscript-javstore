@@ -416,13 +416,13 @@ test('a page restored from the back/forward cache syncs again and keeps its poll
         window.clearInterval = id => { intervals.delete(id); clearInterval(id); };
     } });
     await waitFor(() => store.read(SESSION_KEY)?.completedAt);
-    assert.equal(intervals.size, 2, 'storage poll and remote poll');
+    assert.equal(intervals.size, 3, 'storage poll, remote poll and the other-tab sync check');
     tab.window.dispatchEvent(new tab.window.Event('pagehide'));
-    assert.equal(intervals.size, 0, 'both timers stop on pagehide');
+    assert.equal(intervals.size, 0, 'every timer stops on pagehide');
     const restored = new tab.window.Event('pageshow');
     Object.defineProperty(restored, 'persisted', { value: true });
     tab.window.dispatchEvent(restored);
-    assert.equal(intervals.size, 2, 'both timers come back');
+    assert.equal(intervals.size, 3, 'every timer comes back');
     clickCard(tab.window, '/a.html');
     await waitFor(() => remote.visited().includes(abs('/a.html')), { timeout: 9000 });
 });

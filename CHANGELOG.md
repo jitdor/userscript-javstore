@@ -1,5 +1,17 @@
 # Changelog
 
+## 6.13.0
+
+- Add: a live sync status next to the JavStore controls, so you can tell when a sync is still running and wait before opening new tabs. A tab opened during a long sync starts from the history as it was before the sync, and on AdGuard it then downloads the whole history again itself.
+  - **Downloading history… N visits** while this tab downloads a large history, such as the first sync after an update, with the count so far.
+  - **Syncing… N visits** while a longer sync runs. A quick sync shows nothing.
+  - **Waiting for another tab to sync…** while this tab's sync waits for another tab's to finish.
+  - **Another tab is syncing…** in the tab you are looking at, while any other JavStore tab syncs.
+  - **Sync complete** for a few seconds once a sync you could see finishes: new tabs opened from then on start from the downloaded history.
+- How it works: AdGuard does not let a tab read what another tab saved, but every JavStore tab shares the sync's Web Lock, and the browser can say whether that lock is held. Only the tab in view asks, every two seconds, and nothing is stored or sent anywhere. Browsers without Web Locks show only the tab's own sync.
+- Tapping the status opens the settings panel. Hover over it for why waiting helps.
+- The worker version moves to 6.13.0 with the userscript; the worker is unchanged.
+
 ## 6.12.0
 
 A review of the whole history and sync design against how AdGuard actually stores userscript data. AdGuard for Mac, Windows and Android give each tab the stored values as they were when the tab loaded, and a tab never sees what other tabs save after that. The script had been designed as if every tab read the same, current storage. With many tabs left open, that broke in several ways, each now covered by a test that reproduces it.
