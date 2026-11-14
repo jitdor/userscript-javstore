@@ -548,7 +548,13 @@
         let text = await readPartSet(current);
         if (text === null && previous) {
             text = await readPartSet(previous);
-            if (text !== null) console.warn(`[JVS] Stored value ${key} is missing parts of its latest version; the one before is read.`);
+            if (text !== null) {
+                // Still counted as incomplete: the newest parts may be on their way, and a
+                // save made from the older copy would replace what only they hold.
+                incompleteValues.set(key, partWrittenAt(current.id));
+                console.warn(`[JVS] Stored value ${key} is missing parts of its latest version; the one before is read.`);
+                return decodeValue(text, key);
+            }
         }
         if (text === null) {
             incompleteValues.set(key, partWrittenAt(current.id));

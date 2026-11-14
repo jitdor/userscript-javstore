@@ -138,6 +138,42 @@ test('P3 a pointer with a missing part falls back to the complete set kept befor
     assert.ok(visitedCount(later) >= 400, `${visitedCount(later)} visits stored after one click`);
 });
 
+// P3b (data loss). The newest set is still missing a part when a page loads, so the page
+// reads the set before it. That part then lands. A save from the older copy must not
+// replace the pointer while the newest set may still complete, or the visits only it holds
+// are gone.
+test('P3b a page that read the previous set does not write over a newest set still arriving', async () => {
+    const store = makeStore({ snapshotPerTab: true, maxEncodedValue: 8006 });
+    store.write(PROBE_KEY, { limit: 6000, measuredAt: Date.now() });
+    const older = history(400);
+    const newer = history(400);
+    const extra = 'https://javstore.net/999999-FC2-PPV-9999999-Only-In-Newest-pn.html';
+    newer.visited[extra] = Date.now() - 20000;
+    const parts = (id, value) => {
+        const text = JSON.stringify(value);
+        const third = Math.ceil(text.length / 3);
+        return { text, pieces: [0, 1, 2].map(i => [`${PART_PREFIX}${id}_${i}`, JSON.stringify(text.slice(i * third, (i + 1) * third))]) };
+    };
+    const before = `${(Date.now() - 60000).toString(36)}-prev0001`;
+    const latest = `${(Date.now() - 30000).toString(36)}-prev0002`;
+    const a = parts(before, older);
+    const b = parts(latest, newer);
+    a.pieces.forEach(([key, raw]) => store.data.set(key, raw));
+    store.data.set(b.pieces[0][0], b.pieces[0][1]);
+    store.data.set(b.pieces[2][0], b.pieces[2][1]);
+    store.data.set(STATE_KEY, JSON.stringify(JSON.stringify({
+        __jvsParts: 3, id: latest, length: b.text.length, prev: { id: before, count: 3, length: a.text.length },
+    })));
+
+    const tab = await openTab(store, { html: listing() });
+    await settle(50);
+    // The late part lands after the page took its snapshot.
+    store.data.set(b.pieces[1][0], b.pieces[1][1]);
+    clickCard(tab.window, '/c-1.html');
+    await settle(800);
+    assert.ok(visitedUrls(store).includes(extra), 'the visit only the newest set held was lost');
+});
+
 // P4 (data loss; assumes AdGuard's GM_setValue resolves once the page's own copy is updated
 // and the requests to the app are in flight side by side). A click saves and navigates.
 // storeValue sends every part at once and the pointer right after; the pointer is a tiny
