@@ -3130,7 +3130,7 @@
                     min-height: 40px; border: 1px solid rgba(255,255,255,.2); border-radius: 999px;
                     color: #fff; background: #111827; box-shadow: 0 8px 24px rgba(0,0,0,.28);
                 }
-                .pill { padding: 8px 14px; }
+                .pill { padding: 8px 14px; white-space: nowrap; }
                 .icon-button { width: 40px; padding: 0; font-size: 18px; }
                 button:hover { background: #1f2937; }
                 button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-visible {
@@ -3191,7 +3191,14 @@
                 .toast.error { background: #991b1b; }
                 .toast.show { opacity: 1; transform: translateY(0); }
                 @media (max-width: 520px) {
-                    .dock { right: 10px; bottom: 10px; }
+                    /* On a phone the controls wrap rather than run off the left edge, and the
+                       sync status takes a row of its own above them so it is always readable. */
+                    .dock {
+                        right: 10px; bottom: 10px; left: 10px; flex-wrap: wrap; justify-content: flex-end;
+                        pointer-events: none;
+                    }
+                    .dock > * { pointer-events: auto; }
+                    .pill.sync-status { order: -1; flex: 1 0 100%; text-align: center; }
                     .panel { right: 10px; bottom: 62px; width: calc(100vw - 20px); max-height: calc(100vh - 76px); }
                     .grid { grid-template-columns: 1fr; }
                     .full { grid-column: auto; }

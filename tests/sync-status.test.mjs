@@ -93,3 +93,18 @@ test('a tab with nothing of its own to sync shows another tab\'s sync through th
     gate.release();
     await waitFor(() => status(settled) === 'Sync complete' || status(settled) === '', { timeout: 8000 });
 });
+
+// On a phone the dock wraps, and the status takes a row of its own above the other
+// controls, so a long label cannot push them, or itself, off the screen. The dock spans the
+// width there, so its empty part must let taps through to the page.
+test('on narrow screens the dock wraps, puts the status first, and lets taps through', async () => {
+    const store = makeStore();
+    const tab = await openTab(store, { html: listing() });
+    const css = tab.shadow().querySelector('style').textContent;
+    const narrow = css.slice(css.indexOf('@media (max-width: 520px)'));
+    assert.match(narrow, /\.dock\s*\{[^}]*flex-wrap:\s*wrap/);
+    assert.match(narrow, /\.dock\s*\{[^}]*pointer-events:\s*none/);
+    assert.match(narrow, /\.dock > \*\s*\{\s*pointer-events:\s*auto/);
+    assert.match(narrow, /\.pill\.sync-status\s*\{[^}]*order:\s*-1[^}]*flex:\s*1 0 100%/);
+    assert.match(css, /\.pill\s*\{[^}]*white-space:\s*nowrap/);
+});
