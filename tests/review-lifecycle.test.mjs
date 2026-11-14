@@ -153,7 +153,7 @@ test('measure: GM traffic for an item page load and its push with sync on (sessi
 
     const before = m.snapshot();
     await openTab(store, { html: detailHtml, url: 'https://javstore.net/700002-Item-pn.html', remote });
-    await settle();
+    await waitFor(() => m.since(before).sessionWrites >= 1);
     const load = m.since(before);
     t.diagnostic(`item page load, sync on: ${describe(load)}; worker requests ${remote.requests.length - requests}`);
 

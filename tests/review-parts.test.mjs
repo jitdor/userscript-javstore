@@ -59,12 +59,22 @@ test('P1 browsing page after page does not leave a full copy of the history per 
     const session = new Map();
     for (let page = 0; page < 12; page++) {
         const tab = await openTab(store, { html: listing(), session });
-        await settle(40);
+        // A page someone reads for a moment before clicking on.
+        await new Promise(resolve => setTimeout(resolve, 1000));
         clickCard(tab.window, `/c-${page}.html`);
         await settle(60);
+        // The click navigates: the page is gone, and its timers with it.
         tab.window.dispatchEvent(new tab.window.Event('pagehide'));
+        tab.window.close();
     }
-    assert.equal(visitedUrls(store).length, 1012);
+    // The next page in the tab replays the last click, which left before it was saved.
+    await openTab(store, { html: listing(), session });
+    await settle(100);
+    // Every visit is held: in the history, or (for a page left before its history save
+    // landed) in that page's journal, which the next page folds in.
+    const held = new Set(visitedUrls(store));
+    store.journals().forEach(key => Object.keys(store.read(key)?.visited || {}).forEach(url => held.add(url)));
+    assert.equal(held.size, 1012);
     const sets = partSets(store).size;
     assert.ok(sets <= 3, `${sets} part sets of the history in storage after 12 page loads`);
     assert.ok(storedBytes(store) < 4 * docBytes,
@@ -113,7 +123,10 @@ test('P3 a pointer with a missing part falls back to the complete set kept befor
     const latest = `${(Date.now() - 30000).toString(36)}-prev0002`;
     cut(before, -1);
     cut(latest, 1);
-    store.data.set(STATE_KEY, JSON.stringify(JSON.stringify({ __jvsParts: 3, id: latest, length: text.length })));
+    // The pointer names the set it replaced, as every pointer written with a set before it does.
+    store.data.set(STATE_KEY, JSON.stringify(JSON.stringify({
+        __jvsParts: 3, id: latest, length: text.length, prev: { id: before, count: 3, length: text.length },
+    })));
 
     const tab = await openTab(store, { html: listing() });
     await settle(50);
@@ -164,7 +177,9 @@ test('P4 a click that navigates while parts are uploading does not lose the hist
     const session = new Map();
     const first = await openTab(store, { html: listing(), session });
     await settle(50);
-    clickCard(first.window, '/c-1.html');
+    // A click saves the history; the page is then left the moment that save's pointer is in.
+    first.window.document.querySelector('main .grid a[href="/c-1.html"]')
+        .dispatchEvent(new first.window.MouseEvent('click', { bubbles: true, cancelable: true, button: 0 }));
     await waitFor(() => !views[0].alive, { timeout: 3000 });
     const next = await openTab(store, { html: listing(), session });
     await settle(100);

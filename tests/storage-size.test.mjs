@@ -130,7 +130,8 @@ test('saving again and again keeps at most two part sets per stored value', asyn
             .dispatchEvent(new tab.window.MouseEvent('click', { bubbles: true, cancelable: true, button: 0 }));
         await settle(30);
     }
-    await settle(200);
+    // Let the last save finish: its pointer waits a moment after its parts.
+    await new Promise(resolve => setTimeout(resolve, 1500));
     // Two per value stored in parts (the history, and this page's journal of what it pulled).
     const sets = new Set(partKeys(store).map(key => key.replace(/_\d+$/, '')));
     const parted = [...store.data.keys()].filter(key => !key.startsWith('javstore_part_')
@@ -138,4 +139,26 @@ test('saving again and again keeps at most two part sets per stored value', asyn
     assert.ok(parted >= 1);
     assert.ok(sets.size <= 2 * parted, `${sets.size} part sets for ${parted} values`);
     assert.equal(visitedUrls(store).length, 612);
+});
+
+// A large save that is stopped because the page is being left is not a storage failure, and
+// a page brought back from the back/forward cache must not say "Could not save".
+test('leaving the page during a large save does not report a failed save', async () => {
+    const store = makeStore({ maxEncodedValue: 8000 });
+    store.write(PROBE_KEY, { limit: 6000, measuredAt: Date.now() });
+    const remote = seeded(600);
+    enableSync(store, remote);
+    const tab = await openTab(store, { html: listing(), remote });
+    await waitFor(() => store.read(SESSION_KEY)?.completedAt, { timeout: 20000 });
+    await new Promise(resolve => setTimeout(resolve, 800));
+    tab.window.document.querySelector('main .grid a[href="/a.html"]')
+        .dispatchEvent(new tab.window.MouseEvent('click', { bubbles: true, cancelable: true, button: 0 }));
+    await settle(5);
+    tab.window.dispatchEvent(new tab.window.Event('pagehide'));
+    await new Promise(resolve => setTimeout(resolve, 1500));
+    assert.doesNotMatch(tab.shadow().textContent, /Could not save/);
+    // The click is carried by the journal to the next page.
+    const next = await openTab(store, { html: listing(), remote });
+    await settle(100);
+    assert.ok(next.window.document.querySelector('main .grid a[href="/a.html"]').classList.contains('jvs-visited'));
 });

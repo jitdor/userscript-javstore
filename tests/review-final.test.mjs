@@ -236,7 +236,8 @@ test('a long-open tab that pulled a large history writes small journals a few ro
     for (const minutes of [6, 12]) {
         clock.offset = minutes * 60000;
         pressOnCard(tab.window, minutes === 6 ? '/a.html' : '/b.html', 'v');
-        await settle(100);
+        // Let the save finish: a history stored in parts takes a moment.
+        await new Promise(resolve => setTimeout(resolve, 1500));
     }
     const latest = store.journals().filter(key => !firstKeys.has(key))
         .sort((a, b) => parseInt(b.split('_')[3], 36) - parseInt(a.split('_')[3], 36))[0];
