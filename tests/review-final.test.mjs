@@ -227,7 +227,9 @@ test('a long-open tab that pulled a large history writes small journals a few ro
     const tab = await open({ remote });
     await waitFor(() => store.read(SESSION_KEY)?.completedAt, { timeout: 20000 });
     await settle(100);
-    const largest = () => Math.max(0, ...store.journals().map(key => store.data.get(key).length));
+    // Measured whole: a large journal is stored as parts behind a short pointer.
+    const size = key => JSON.stringify(store.read(key) ?? '').length;
+    const largest = () => Math.max(0, ...store.journals().map(size));
     assert.ok(largest() > 100000, 'the pulled rows are journaled at first');
     const firstKeys = new Set(store.journals());
 
@@ -239,7 +241,7 @@ test('a long-open tab that pulled a large history writes small journals a few ro
     const latest = store.journals().filter(key => !firstKeys.has(key))
         .sort((a, b) => parseInt(b.split('_')[3], 36) - parseInt(a.split('_')[3], 36))[0];
     assert.ok(latest, 'the page moved on to a new key');
-    assert.ok(store.data.get(latest).length < 20000,
-        `the latest journal is ${(store.data.get(latest).length / 1024).toFixed(0)} KB`);
+    assert.ok(size(latest) < 20000,
+        `the latest journal is ${(size(latest) / 1024).toFixed(0)} KB`);
     assert.ok([...firstKeys].every(key => store.journals().includes(key)), 'the key holding the rows stays');
 });

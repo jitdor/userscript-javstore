@@ -1,5 +1,13 @@
 # Changelog
 
+## 6.13.1
+
+- Fix: on AdGuard, "Restored N visited URLs from the worker" appeared on every page load, and every page downloaded the whole history again. 6.12.0 removed one cause; this fixes the one that remained. AdGuard sends each stored value to its app as a single request, with the value URL-encoded inside it. A value too large for that request is not kept, and the script is not told: the page that saved it still reads it back from its own copy. Once the history grew past a few hundred visits it no longer fit, so it survived no page load at all. Small values, such as the sync settings, were kept, which is why sync kept working and the problem looked like something else.
+- Change: a value larger than the device keeps is now stored as parts, each small enough, plus a short pointer to them, written last. A value with a part missing is read as missing, never as a shorter history. Each tab removes the part sets it replaced, keeping the latest two in case the newest pointer never landed. Parts that nothing refers to are removed half an hour after they were written.
+- Add: the script measures how large a value the device keeps. It stores test values of 2, 8, 32 and 128 KB, checks on the next page load which came back, uses the largest, and measures again weekly. Until it knows, it uses parts of about 6 KB. The settings panel shows the result, and warns if a stored value was found with parts missing. Managers that report other tabs' writes, such as Tampermonkey, are not measured: they have no such limit.
+- The test suites can now run against a manager that drops oversized values (`JVS_VALUE_LIMIT=8000 npm test`). Under that limit, 6.13.0 fails 12 tests; this release passes all of them.
+- The worker version moves to 6.13.1 with the userscript; the worker is unchanged.
+
 ## 6.13.0
 
 - Add: a live sync status next to the JavStore controls, so you can tell when a sync is still running and wait before opening new tabs. A tab opened during a long sync starts from the history as it was before the sync, and on AdGuard it then downloads the whole history again itself.

@@ -31,10 +31,18 @@ const openWindows = new Set();
 // `snapshotPerTab` is AdGuard's behaviour across tabs: each tab reads the values storage
 // held when the tab loaded, plus its own writes. Writes still reach storage, so a tab
 // opened later sees them, but a tab that is already open never does.
+//
+// `maxEncodedValue` is the size limit AdGuard appears to put on one stored value: each
+// GM_setValue travels to the AdGuard app as one request with the value URL-encoded in it,
+// and a value too large for that request is not kept, without the script being told. The
+// tab that wrote it still reads it back (AdGuard keeps the page's own copy); no tab that
+// loads later ever sees it.
 export function makeStore({
     latency = 0, journaling = true, primitivesOnly = false,
     // JVS_DOTTED=1 runs every suite against the Userscripts app's API shape.
     dottedOnly = process.env.JVS_DOTTED === '1', snapshotPerTab = false,
+    // JVS_VALUE_LIMIT=8000 runs every suite against a manager that drops larger values.
+    maxEncodedValue = Number(process.env.JVS_VALUE_LIMIT) || Infinity,
 } = {}) {
     const data = new Map();
     const delay = () => (latency ? new Promise(resolve => setTimeout(resolve, Math.random() * latency)) : null);
@@ -56,6 +64,7 @@ export function makeStore({
             await delay();
             if (this.dropWrites) return;
             if (this.dropStateWrites && key === 'javstore_cleanup_state_v2') return;
+            if (encodeURIComponent(typeof value === 'string' ? value : JSON.stringify(value)).length > maxEncodedValue) return;
             const kept = primitivesOnly && value && typeof value === 'object' ? String(value) : value;
             data.set(key, JSON.stringify(kept));
         },
@@ -68,10 +77,19 @@ export function makeStore({
             if (this.dropWrites) return;
             data.delete(key);
         },
+        // A value the script stored as parts comes back whole, as the script reads it; one
+        // whose parts are not all there reads as missing.
         read(key) {
             if (!data.has(key)) return undefined;
-            const value = JSON.parse(data.get(key));
-            return typeof value === 'string' ? JSON.parse(value) : value;
+            const raw = JSON.parse(data.get(key));
+            const value = typeof raw === 'string' ? JSON.parse(raw) : raw;
+            if (!value || typeof value.__jvsParts !== 'number') return value;
+            const pieces = Array.from({ length: value.__jvsParts }, (_, index) => {
+                const part = `javstore_part_${value.id}_${index}`;
+                return data.has(part) ? JSON.parse(data.get(part)) : null;
+            });
+            if (pieces.some(piece => typeof piece !== 'string')) return undefined;
+            return JSON.parse(pieces.join(''));
         },
         write(key, value) {
             data.set(key, JSON.stringify(JSON.stringify(value)));
@@ -94,7 +112,8 @@ export function makeStore({
                 },
                 async set(key, value) {
                     await store.set(key, value);
-                    if (data.has(key)) seen.set(key, data.get(key));
+                    // The page's own copy, whether or not storage kept it.
+                    seen.set(key, JSON.stringify(value));
                 },
                 async list() {
                     await delay();
